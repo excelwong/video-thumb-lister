@@ -13,6 +13,7 @@ Thumbs.db
 dist/
 build/
 output/
+video_thumb_output/
 test/
 ffmpeg/
 GITHUB_PUSH_STATE.md
