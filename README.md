@@ -115,11 +115,26 @@ python video_thumb_lister.py "D:\videos" --force
 
 ---
 
-## 七、文件说明
+## 七、打包成 CHM（离线电子书）
+
+GUI 点「**打包成 CHM**」可把当前画廊编译成单个 `.chm` 离线帮助文件（左侧目录树 + 缩略图网格），方便拷贝分发。
+
+- **编译器**：优先微软 `hhc.exe`（生成真正的目录树/导航栏）；若缺失或注册失败，自动回退 `chmcmd.exe`（开源、免注册，但本版本无目录树，仅兜底）。
+- **依赖 `tools/` 目录**（已随仓库提交）：内含 `hhc.exe`、`hha.dll`、`itcc.dll`、`chmcmd.exe`、`register_hhw.bat`。
+  - **`itcc.dll` 必须先注册一次**：右键 `tools/register_hhw.bat` → **以管理员身份运行**。脚本会用 32 位 `regsvr32`（`SysWOW64`）注册 `itcc.dll` / `itircl.dll` / `itss.dll`。
+    > 注意：`hha.dll` 由 `hhc.exe` 直接加载，**无需也不能**用 `regsvr32` 注册（注册会返回 4）。
+  - 缺 `hhc.exe` / `itcc.dll` 时，程序会联网从 GitHub 便携包（`skywind3000/support` 的 `htmlhelp.zip`）自动下载解压到 `tools/`（需联网；网络不可用时请手动下载放入）。
+- 若仍报 `HHC6003`：确认 `itcc.dll` 已注册、且 `tools/` 下存在 `hha.dll`。
+
+---
+
+## 八、文件说明
 
 | 文件 | 作用 |
 |------|------|
-| `video_thumb_lister.py` | 核心：扫描、抽帧、缓存、封面匹配、HTML 画廊生成、本地 HTTP 服务（含 `/thumb` `/video` `/play` `/open-explorer`） |
+| `video_thumb_lister.py` | 核心：扫描、抽帧、缓存、封面匹配、HTML 画廊生成、本地 HTTP 服务、CHM 打包 |
 | `video_thumb_lister_gui.py` | tkinter 图形界面，复用上面的核心逻辑 |
+| `gallery_server.py` | 本地画廊 HTTP 服务（供浏览器打开画廊、点缩略图唤起播放器） |
 | `启动.bat` | 一键启动 GUI（优先 `pythonw` 无控制台） |
-| `video_thumb_output/` | 画廊 HTML、扫描日志、失败日志（运行时生成） |
+| `tools/` | CHM 编译器依赖：hhc.exe / hha.dll / itcc.dll / chmcmd.exe / register_hhw.bat（已提交，运行时需先注册 itcc.dll） |
+| `video_thumb_output/` | 画廊 HTML、扫描日志、失败日志（运行时生成，不提交） |

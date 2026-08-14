@@ -31,13 +31,13 @@ import threading
 import subprocess
 import tempfile
 import time
-import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 # 让本文件能 import 同目录的 video_thumb_lister
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import video_thumb_lister as vtl
+from video_thumb_lister import reveal_in_explorer
 
 
 class ThumbListerApp(tk.Tk):
@@ -94,6 +94,9 @@ class ThumbListerApp(tk.Tk):
         self.open_btn = ttk.Button(bottom, text="在浏览器中打开画廊",
                                    command=self._open_gallery)
         self.open_btn.pack(side="left")
+        self.chm_btn = ttk.Button(bottom, text="打包成 CHM",
+                                  command=self._build_chm)
+        self.chm_btn.pack(side="left", padx=2)
         self.stop_btn = ttk.Button(bottom, text="停止后台服务",
                                    command=self._stop_server, state="disabled")
         self.stop_btn.pack(side="left", padx=2)
@@ -247,6 +250,22 @@ class ThumbListerApp(tk.Tk):
                     self._set_status("扫描完成")
                     self.open_btn.configure(state="normal")
                     self._start_server_and_open(out_html)
+                elif kind == "chm_done":
+                    chm_path = payload
+                    self._set_progress(1.0)
+                    self._set_status("CHM 打包完成")
+                    self._log(f"CHM：{chm_path}")
+                    self.chm_btn.configure(state="normal")
+                    try:
+                        os.startfile(chm_path)  # 用默认 CHM 查看器(hh.exe)打开
+                    except Exception as e:  # noqa: BLE001
+                        self._log("打开 CHM 失败：" + str(e))
+                    messagebox.showinfo("完成", f"CHM 已生成并用 CHM 查看器打开：\n{chm_path}")
+                elif kind == "chm_error":
+                    self._set_status("CHM 打包失败")
+                    self._log("错误：" + payload)
+                    self.chm_btn.configure(state="normal")
+                    messagebox.showerror("CHM 打包失败", payload)
         except queue.Empty:
             pass
         if self.worker and self.worker.is_alive():
@@ -277,14 +296,15 @@ class ThumbListerApp(tk.Tk):
     def _start_server_and_open(self, out_html):
         gdir = os.path.dirname(out_html)
         gname = os.path.basename(out_html)
-        # 仅在「服务未启动」「子进程已退出」或「正在托管的目录与本次不相同」
-        # 时，才启动一个新的【脱离 GUI 父进程】的后台服务；否则直接复用。
-        # 这样即使关闭 GUI 窗口、主进程退出，画廊页面里的左键点击播放
-        # （/play 端点调起 PotPlayer）仍可正常工作。
+        # 确保【独立后台服务】(gallery_server.py) 在运行：画廊里的缩略图、PotPlayer
+        # 播放、『打开文件浏览器』都依赖它。服务用固定端口（默认 8765），若已在线
+        # 则直接复用（可能是上次关闭 GUI 后残留的，或用户手动启动的独立进程）。
+        # 这样即使关闭 GUI 窗口、主进程退出，画廊仍可正常工作。
         same_dir = bool(self.serve_out_dir and self.serve_out_dir == gdir)
-        if self.serve_proc is None or self.serve_proc.poll() is not None or not same_dir:
-            if not same_dir and self.serve_proc is not None and self.serve_proc.poll() is None:
-                # 旧服务托管的是别的目录，先停掉再起新的（避免端口/目录错配）
+        proc_running = (self.serve_proc is not None and self.serve_proc.poll() is None)
+        if not (proc_running and same_dir):
+            if proc_running and not same_dir:
+                # 旧服务托管的是别的目录，先停掉再起新的（避免目录错配）
                 try:
                     self.serve_proc.terminate()
                 except Exception:  # noqa: BLE001
@@ -293,34 +313,28 @@ class ThumbListerApp(tk.Tk):
             port_file = os.path.join(
                 tempfile.gettempdir(), f"vtl_port_{os.getpid()}_{int(time.time())}.tmp")
             try:
-                self.serve_proc = vtl.launch_server_subprocess(gdir, gname, port_file)
+                self.serve_proc, port = vtl.launch_server_subprocess(gdir, gname, port_file)
             except Exception as e:  # noqa: BLE001
-                self._log("启动后台服务失败，回退为直接打开文件：" + str(e))
+                self._log("启动后台服务失败，将用文件浏览器直接定位文件：" + str(e))
                 self.serve_proc = None
-                webbrowser.open(out_html)
+                reveal_in_explorer(out_html)
                 return
-            port = self._wait_port(port_file)
             try:
                 if os.path.isfile(port_file):
                     os.remove(port_file)
             except Exception:  # noqa: BLE001
                 pass
-            if port:
-                self.serve_port = port
-                self.serve_out_dir = gdir
-                self.stop_btn.configure(state="normal")
-                self._log(f"后台本地服务已启动（独立进程，关闭窗口也会继续）："
-                           f"http://127.0.0.1:{port}/{gname}")
-            else:
-                self._log("未能获取后台服务端口，回退为直接打开文件。")
-                self.serve_proc = None
-                webbrowser.open(out_html)
-                return
+            self.serve_port = port
+            self.serve_out_dir = gdir
+            self.stop_btn.configure(state="normal")
+            self._log(f"后台服务已就绪（独立进程 gallery_server.py，关闭窗口也会继续）："
+                       f"http://127.0.0.1:{port}/{gname}")
         else:
-            # 服务仍在运行且托管同一目录：直接按文件名打开新画廊即可
-            self._log(f"复用已运行的后台本地服务："
+            # 服务仍在运行且托管同一目录：直接复用
+            self._log(f"复用已运行的后台服务："
                        f"http://127.0.0.1:{self.serve_port}/{gname}")
-        webbrowser.open(self._gallery_url(out_html))
+        # 生成后用【文件资源管理器】定位/选中该画廊文件，而不是用浏览器自动打开
+        reveal_in_explorer(out_html)
 
     def _open_gallery(self, target_html=None):
         """打开画廊网页——与「扫描生成」功能解耦，可在任意时刻使用。
@@ -346,6 +360,36 @@ class ThumbListerApp(tk.Tk):
         self.open_btn.configure(state="normal")
         self._log(f"打开画廊：{target}")
         self._start_server_and_open(target)
+
+    # ---------------------------------------------------------- 打包 CHM
+    def _build_chm(self):
+        """把当前目录的画廊打包成 .chm（调用本机 hhc.exe 编译）。"""
+        d = self._dir.get().strip()
+        if not d or not os.path.isdir(d):
+            messagebox.showerror("错误", "请先选择一个有效的目录。")
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("提示", "正在处理中，请稍候。")
+            return
+        self.chm_btn.configure(state="disabled")
+        self._set_progress(0)
+        self._set_status("准备打包 CHM…")
+        self._log(f"开始打包 CHM：{d}")
+        self.worker = threading.Thread(target=self._chm_worker, args=(d,), daemon=True)
+        self.worker.start()
+        self.after(100, self._poll)
+
+    def _chm_worker(self, directory):
+        try:
+            videos = vtl.scan_videos(directory)
+            self.q.put(("log", f"找到 {len(videos)} 个视频，准备生成 CHM（封面取自已抽好的 .thumb.jpg）…"))
+            out_dir = os.path.join(os.getcwd(), "video_thumb_output")
+            chm_path = vtl.build_chm(videos, out_dir, directory)
+            self.q.put(("chm_done", chm_path))
+        except FileNotFoundError as e:
+            self.q.put(("chm_error", str(e)))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("chm_error", f"打包失败：{e}"))
 
     def _stop_server(self):
         """手动停止后台本地服务（默认关闭窗口不会停止，以便点击播放持续可用）。"""

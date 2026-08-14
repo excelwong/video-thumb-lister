@@ -49,6 +49,16 @@ import threading
 import urllib.parse
 import webbrowser
 
+# 后台画廊服务已解耦到独立的 gallery_server.py（可单独运行）。
+# 这里只导入它暴露的端口/地址工具与启动函数，避免在 video_thumb_lister 里
+# 再维护一份重复的 HTTP 服务实现。
+from gallery_server import (  # noqa: E402
+    gallery_server_port,
+    gallery_server_base,
+    is_server_up,
+    run_server,
+)
+
 # 支持的视频扩展名（小写）
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".m4v",
@@ -138,6 +148,229 @@ def find_player():
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _read_reg_sz(root, subkey, value=None):
+    """读取注册表字符串值；任意一步失败返回 None（跨平台安全）。"""
+    try:
+        import winreg
+    except Exception:  # noqa: BLE001 - 非 Windows
+        return None
+    try:
+        with winreg.OpenKey(root, subkey) as k:
+            if value is None:
+                return winreg.QueryValue(k, None)
+            return winreg.QueryValueEx(k, value)[0]
+    except OSError:
+        return None
+
+
+# 便携版 HTML Help Workshop（含 hhc.exe / hha.dll / itcc.dll），来自 GitHub 发布：
+#   https://github.com/skywind3000/support/releases/download/1.0.0/htmlhelp.zip
+_HHW_ZIP_URL = "https://github.com/skywind3000/support/releases/download/1.0.0/htmlhelp.zip"
+_HHW_FILES = ("hhc.exe", "hha.dll", "itcc.dll")
+_HHW_FETCH_TRIED = False
+
+
+def _fetch_hhw():
+    """尝试从 GitHub 下载便携版 HTML Help Workshop 并解压到本应用 tools/ 下。
+
+    仅在 tools/ 缺少 hhc.exe 或 itcc.dll 时才真正下载；已齐全则直接返回 True。
+    网络不可达 / 被拦截 / 解压失败均静默返回 False，由调用方回退到 chmcmd
+    并在报错时给出手动下载指引（见 build_chm 的错误信息）。
+    返回 True 表示 tools/ 下已至少有 hhc.exe（核心依赖就位）。
+    """
+    global _HHW_FETCH_TRIED
+    here = os.path.dirname(os.path.abspath(__file__))
+    tools_dir = os.path.join(here, "tools")
+    hhc_local = os.path.join(tools_dir, "hhc.exe")
+    itcc_local = os.path.join(tools_dir, "itcc.dll")
+    if os.path.isfile(hhc_local) and os.path.isfile(itcc_local):
+        return True
+    if _HHW_FETCH_TRIED:
+        return os.path.isfile(hhc_local)
+    _HHW_FETCH_TRIED = True
+    try:
+        import tempfile
+        import urllib.request
+        import zipfile
+        os.makedirs(tools_dir, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            req = urllib.request.Request(
+                _HHW_ZIP_URL,
+                headers={"User-Agent": "Mozilla/5.0 (video-thumb-lister)"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                 open(tmp_path, "wb") as out:
+                out.write(resp.read())
+            with zipfile.ZipFile(tmp_path) as zf:
+                names = set(zf.namelist())
+                for needed in _HHW_FILES:
+                    # 兼容 zip 顶层有/无子目录两种布局
+                    hit = next((n for n in names
+                                if n.lower() == needed.lower()
+                                or n.lower().endswith("/" + needed.lower())), None)
+                    if not hit:
+                        continue
+                    dest = os.path.join(tools_dir, needed)
+                    if os.path.isfile(dest):
+                        continue
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(hit))
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:  # noqa: BLE001
+                pass
+        return os.path.isfile(hhc_local)
+    except Exception:  # noqa: BLE001
+        return os.path.isfile(hhc_local)
+
+
+def find_hhc():
+    """定位 Microsoft HTML Help Workshop 的 hhc.exe（CHM 编译器）。
+
+    按以下顺序查找，命中即返回绝对路径；都找不到返回 None：
+      0) 若本地 tools/ 缺 hhc/itcc，先尝试自动下载便携版（见 _fetch_hhw）；
+      1) 环境变量 HHC_PATH（用户手动指定）；
+      2) PATH 中的 hhc.exe；
+      3) 常见安装目录；
+      4) 注册表 App Paths（hhw.exe / hhc.exe）。
+    若返回 None，说明本机未取得 HTML Help Workshop —— 调用方应给出
+    清晰的安装/配置指引，而不是自行实现 CHM 二进制格式。
+    """
+    # 本地 tools/ 缺核心文件时，先尝试自动下载并解压（网络不可达则静默跳过）
+    _fetch_hhw()
+    candidates = []
+    env = os.environ.get("HHC_PATH")
+    if env:
+        candidates.append(env)
+    # 本应用目录 / tools 子目录：把 hhc.exe 放应用旁边即可，免去配置 PATH
+    try:
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _c in (os.path.join(_here, "hhc.exe"),
+                   os.path.join(_here, "tools", "hhc.exe"),
+                   os.path.join(_here, "hhc", "hhc.exe")):
+            if os.path.isfile(_c):
+                return _c
+    except Exception:  # noqa: BLE001
+        pass
+    candidates += [
+        "hhc.exe",
+        r"C:/Program Files (x86)/HTML Help Workshop/hhc.exe",
+        r"C:/Program Files/HTML Help Workshop/hhc.exe",
+        r"C:/HTML Help Workshop/hhc.exe",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        if c == "hhc.exe":
+            p = shutil.which("hhc.exe")
+            if p:
+                return p
+            continue
+        if os.path.isfile(c):
+            return c
+    # 注册表 App Paths（HTML Help Workshop 注册的是 hhw.exe，其目录含 hhc.exe）
+    try:
+        import winreg
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for app in ("hhw.exe", "hhc.exe"):
+                v = _read_reg_sz(hive,
+                                 r"Software\Microsoft\Windows\CurrentVersion\App Paths\\" + app)
+                if v:
+                    exe = v.split('"')[0].strip() if v.strip().startswith('"') else v.strip()
+                    exe = exe.strip('"')
+                    if os.path.isfile(exe):
+                        return exe
+                    # App Paths 的默认值是 exe 路径，但有时只给了目录；补 hhc.exe
+                    cand = os.path.join(os.path.dirname(exe), "hhc.exe")
+                    if os.path.isfile(cand):
+                        return cand
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def find_chmcmd():
+    """定位 Free Pascal 的 chmcmd.exe（开源 CHM 编译器，不依赖 itircl/注册）。
+
+    查找顺序，命中即返回绝对路径；都找不到返回 None：
+      1) 环境变量 CHMCMD_PATH；
+      2) 本应用目录 / tools 子目录（把 chmcmd.exe 放旁边即可）；
+      3) PATH 中的 chmcmd.exe；
+      4) 常见目录。
+    """
+    candidates = []
+    env = os.environ.get("CHMCMD_PATH")
+    if env:
+        candidates.append(env)
+    try:
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _c in (os.path.join(_here, "chmcmd.exe"),
+                   os.path.join(_here, "tools", "chmcmd.exe")):
+            if os.path.isfile(_c):
+                return _c
+    except Exception:  # noqa: BLE001
+        pass
+    candidates += [
+        "chmcmd.exe",
+        r"C:/Program Files (x86)/HTML Help Workshop/chmcmd.exe",
+        r"C:/Program Files/HTML Help Workshop/chmcmd.exe",
+    ]
+    for c in candidates:
+        if c == "chmcmd.exe":
+            p = shutil.which("chmcmd.exe")
+            if p:
+                return p
+            continue
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _regsvr(dll_path):
+    """用 32 位 regsvr32 静默注册一个 COM DLL；文件不存在或失败则忽略。"""
+    try:
+        if not dll_path or not os.path.isfile(dll_path):
+            return
+        # hhc 是 32 位程序，注册 32 位 DLL 必须用 32 位 regsvr32（SysWOW64）
+        rs = r"C:/Windows/SysWOW64/regsvr32.exe"
+        if not os.path.isfile(rs):
+            rs = "regsvr32.exe"
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run([rs, "/s", dll_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=flags)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ensure_hhw_registered(hhc_path):
+    """尽力注册 HTML Help Workshop 的 COM 组件，避免 hhc 编译失败。
+
+    hhc.exe 是 32 位程序，编译时依赖需要注册的 COM 组件（默认与 hhc.exe 同目录）：
+      - itcc.dll : 目录/索引编译器（导出 DllRegisterServer，必须注册）；
+                   系统 itircl.dll 运行时会调用它，缺失/未注册 →
+                   HHC6003: The file Itircl.dll has not been registered correctly
+    说明：hha.dll 并不导出 DllRegisterServer，它由 hhc.exe 直接 LoadLibrary 调用，
+          无需也不能用 regsvr32 注册（注册会返回 4）。只要 hha.dll 待在 hhc.exe 同目录即可。
+    此外系统自带的 itircl.dll / itss.dll 通常已注册，这里也顺手补注册一次。
+    注册需管理员权限；无权限/被拦截则静默返回，由调用方在 hhc 报错时给指引。
+    """
+    try:
+        hhw_dir = os.path.dirname(os.path.abspath(hhc_path))
+    except Exception:  # noqa: BLE001
+        hhw_dir = None
+    if hhw_dir:
+        _regsvr(os.path.join(hhw_dir, "itcc.dll"))
+    for sys_dll in (r"C:/Windows/SysWOW64/itircl.dll",
+                    r"C:/Windows/System32/itircl.dll",
+                    r"C:/Windows/SysWOW64/itss.dll",
+                    r"C:/Windows/System32/itss.dll"):
+        _regsvr(sys_dll)
 
 
 def scan_error_log_path(out_dir, directory=None, when=None):
@@ -314,6 +547,30 @@ def file_url(path):
     return "file:///" + p  # 形如 C:/...
 
 
+def reveal_in_explorer(path):
+    """在系统文件浏览器中定位/选中指定文件（而非用浏览器打开它）。
+
+    Windows：explorer /select, "<文件>"  —— 打开资源管理器并高亮该文件；
+    macOS：open -R <文件>；Linux：xdg-open <所在目录>。
+    失败静默忽略（不影响画廊本身已生成的事实）。
+    """
+    path = os.path.abspath(path)
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["explorer.exe", "/select,", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        elif sys.platform == "darwin":
+            subprocess.run(["open", "-R", path])
+        else:
+            subprocess.run(["xdg-open", os.path.dirname(path)])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def gallery_filename_for(root):
     """根据扫描目录的【驱动器和路径】生成唯一的画廊文件名。
 
@@ -479,11 +736,59 @@ def _need_regen(video_path, thumb_file):
         t_thumb = os.path.getmtime(thumb_file)
     except OSError:
         return True
+    # 缩略图存在但本身不是真正的 JPEG（例如旧版本把 webp 改名当 jpg 留下的伪文件），
+    # 重新生成以确保输出是合法的 jpg。
+    if not _is_jpeg_file(thumb_file):
+        return True
     ref = _find_cover(video_path) or video_path
     try:
         return t_thumb < os.path.getmtime(ref)
     except OSError:
         return True
+
+
+def _is_jpeg_file(path):
+    """按文件头魔数判断 path 是否为真正的 JPEG（而非仅以 .jpg 结尾的伪文件，
+    例如把 webp/png 直接改名成 .jpg 的情况）。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(3)
+    except OSError:
+        return False
+    return head[:3] == b"\xff\xd8\xff"
+
+
+def _convert_image_to_jpg(src, dst, ffmpeg):
+    """把图片 src 另存为真正的 JPEG 到 dst。
+
+    - 若 src 已是 JPEG，直接复制（保留原文件、最快）；
+    - 若是 webp/png/bmp/gif 等其它格式，用 ffmpeg 转码为真正的 jpg
+      （而非只改后缀名），避免浏览器/CHM 把 webp 字节当 jpg 解析导致无法显示。
+    返回 True 表示 dst 是真正的 jpg；ffmpeg 不可用或转码失败时回退为
+    原样复制（流程不中断，但显示可能异常）。
+    """
+    if _is_jpeg_file(src):
+        shutil.copy2(src, dst)
+        return True
+    if not ffmpeg:
+        shutil.copy2(src, dst)
+        return False
+    cmd = [ffmpeg, "-y", "-i", src, dst]
+    run_kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Windows 下 ffmpeg 是控制台程序，加 CREATE_NO_WINDOW 让它后台运行不闪窗
+    if sys.platform == "win32":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(cmd, **run_kwargs, check=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        # 转码失败：回退为原样复制，保证流程不中断
+        try:
+            shutil.copy2(src, dst)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    return True
 
 
 def extract_first_frame(ffmpeg, video_path, out_jpg, timeout=120):
@@ -662,42 +967,33 @@ function openFallback(url){
 // 浏览器原生可内联播放的格式（无需外部播放器）；其余格式都必须交给本机 PotPlayer
 var NATIVE_EXT = {'.mp4':1, '.webm':1, '.ogv':1, '.m4v':1, '.mov':1, '.mkv':1};
 function openPlayer(url){
-  // 经本应用服务（http://）时：调用 /play 端点，由本机 PotPlayer 播放。
+  // 始终通过独立的 gallery_server.py（SERVER_BASE）调起本机 PotPlayer，
   // 支持【所有格式】（含 avi / rmvb / flv / ts / vob / wmv / mpg 等浏览器放不了的），
   // 因此任何后缀都【直接播放、不会变成下载】。
-  if (SERVE) {
-    var abs = '';
-    try {
-      var u = new URL(url, location.href);
-      abs = decodeURIComponent(u.searchParams.get('path') || '');
-    } catch (e) { abs = ''; }
-    if (!abs) { openFallback(url); return; }
-    fetch('/play?path=' + encodeURIComponent(abs))
-      .then(function(r){ if (!r.ok) openFallback(url); })
-      .catch(function(){ openFallback(url); });
-    return;
-  }
-  // 本地（file:// 双击打开）场景：file:// 网页无法拉起桌面播放器，只能交给浏览器/系统默认处理。
-  // 浏览器原生支持的格式可内联播放；avi / rmvb / flv / ts / vob / wmv / mpg 等浏览器放不了的，
-  // 直接 window.open 会变成“下载”，故改为打开【所在文件夹】，由用户用本机 PotPlayer 双击播放。
-  var fp = '';
+  // url 形如 SERVER_BASE + '/video?path=<encoded 绝对路径>'
+  var abs = '';
   try {
-    fp = decodeURIComponent(String(url));
-    fp = fp.replace(/^file:/i, '').replace(/^[\\/]+/, '');
-  } catch (e) { fp = String(url); }
-  var dot = fp.lastIndexOf('.');
-  var slash = Math.max(fp.lastIndexOf('/'), fp.lastIndexOf('\\\\'));
-  var ext = (dot > 0 && dot > slash) ? fp.slice(dot).toLowerCase() : '';
-  if (NATIVE_EXT[ext]) { window.open(url, '_blank'); return; }
-  var didx = Math.max(fp.lastIndexOf('/'), fp.lastIndexOf('\\\\'));
-  var dir = didx > 0 ? fp.slice(0, didx) : fp;
-  window.open('file:///' + dir.replace(/\\\\/g, '/'));
-  alert('该格式（' + (ext || '未知') + '）浏览器无法在线播放，已为你打开所在文件夹，请用本机 PotPlayer 双击打开它。\\n\\n提示：通过本应用界面「在浏览器中打开画廊」按钮（http 模式）打开本页，可“点一下直接播放”任意格式。');
+    var u = new URL(url, location.href);
+    abs = decodeURIComponent(u.searchParams.get('path') || '');
+  } catch (e) { abs = ''; }
+  if (!abs) { openFallback(url); return; }
+  fetch(SERVER_BASE + '/play?path=' + encodeURIComponent(abs))
+    .then(function(r){ return r.text(); })
+    .then(function(t){
+      if (t === 'noplayer') { openFallback(url); }
+      else if (t === 'err') { alert('调用播放器失败，请确认本机已安装 PotPlayer。'); }
+      // 'ok' 表示已交由 PotPlayer 播放
+    })
+    .catch(function(){
+      var last = Math.max(abs.lastIndexOf('/'), abs.lastIndexOf(String.fromCharCode(92)));
+      var dir = last > 0 ? abs.slice(0, last) : abs;
+      window.open('file:///' + dir);
+      alert('未能连接画廊服务（gallery_server.py）。已为你打开视频所在文件夹，请用本机 PotPlayer 双击播放。');
+    });
 }
 </script>
 <script>
-var SERVE = (location.protocol !== 'file:');
-if (!SERVE) { var __mw = document.getElementById('modewarn'); if (__mw) __mw.style.display = 'block'; }
+var SERVER_BASE = '___SERVER_BASE___';
 var ctx = document.getElementById('ctx');
 var ctxPath = '', ctxFp = '';
 function showCtx(e, path, fpath){
@@ -729,19 +1025,20 @@ ctx.addEventListener('click', function(e){
   if (act === 'play') {
     openPlayer(makeVurl(ctxPath, ctxFp));
   } else if (act === 'explore') {
-    var dir = ctxPath.replace(/[\\\\/][^\\\\/]*$/, '');
-    if (SERVE) {
-      fetch('/open-explorer?path=' + encodeURIComponent(dir))
-        .then(function(r){ if (!r.ok) alert('无法打开文件浏览器：服务返回 ' + r.status); })
-        .catch(function(){ alert('无法打开文件浏览器，请确认本应用仍在运行。'); });
-    } else {
-      window.open('file:///' + ctxFp.substring(0, ctxFp.lastIndexOf('/')));
-    }
+    var last = Math.max(ctxPath.lastIndexOf('/'), ctxPath.lastIndexOf(String.fromCharCode(92)));
+    var dir = last > 0 ? ctxPath.slice(0, last) : ctxPath;
+    fetch(SERVER_BASE + '/open-explorer?path=' + encodeURIComponent(dir))
+      .then(function(r){ if (!r.ok) alert('打开文件浏览器失败：服务返回 ' + r.status); })
+      .catch(function(){
+        window.open('file:///' + ctxFp.substring(0, ctxFp.lastIndexOf('/')));
+        alert('未能连接画廊服务（gallery_server.py），已改为直接打开所在文件夹。');
+      });
+
   }
 });
 
-function makeThumbUrl(p, fp){ return SERVE ? ('/thumb?path=' + encodeURIComponent(p)) : ('file:///' + fp + '.thumb.jpg'); }
-function makeVurl(p, fp){ return SERVE ? ('/video?path=' + encodeURIComponent(p)) : ('file:///' + fp); }
+function makeThumbUrl(p, fp){ return SERVER_BASE + '/thumb?path=' + encodeURIComponent(p); }
+function makeVurl(p, fp){ return SERVER_BASE + '/video?path=' + encodeURIComponent(p); }
 
 // 初始化：根据打开方式（本地 file:// 双击 / 经本应用服务 http://）补全每张卡片的缩略图与播放链接
 document.addEventListener('DOMContentLoaded', function(){
@@ -749,7 +1046,10 @@ document.addEventListener('DOMContentLoaded', function(){
     var p = card.dataset.path, fp = card.dataset.fpath;
     var img = card.querySelector('img');
     var a = card.querySelector('a.thumb-link');
-    if (img) img.src = makeThumbUrl(p, fp);
+    if (img) {
+      img.src = makeThumbUrl(p, fp);
+      img.onerror = function(){ this.onerror = null; this.src = 'file:///' + fp + '.thumb.jpg'; };
+    }
     if (a) a.href = makeVurl(p, fp);
   });
 });
@@ -843,8 +1143,11 @@ def build_gallery(videos, out_html, root, serve=False):
         name = os.path.basename(v)
         thumb_file = _thumb_path_for_video(v)
         if serve:
-            thumb_url = "/thumb?path=" + urllib.parse.quote(v)
-            vurl = "/video?path=" + urllib.parse.quote(v)
+            # 绝对服务器地址：无论画廊以 http:// 还是 file:// 打开，缩略图/视频
+            # 都命中独立的 gallery_server.py（端口与生成时一致，默认 8765）。
+            base = gallery_server_base()
+            thumb_url = base + "/thumb?path=" + urllib.parse.quote(v)
+            vurl = base + "/video?path=" + urllib.parse.quote(v)
         else:
             thumb_url = file_url(thumb_file)
             vurl = file_url(v)
@@ -878,225 +1181,449 @@ def build_gallery(videos, out_html, root, serve=False):
         .replace("___COUNT___", str(len(videos)))
         .replace("___ROOT___", html.escape(root_abs, quote=True))
         .replace("___GEN___", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        .replace("___SERVER_BASE___", gallery_server_base())
     )
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)
 
 
-def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
-    """启动一个本地 HTTP 服务（守护线程），支撑画廊的『打开文件浏览器』等功能。
+# --------------------------------------------------------------------------
+# CHM 打包：用微软官方 hhc.exe 编译（业界标准做法，不自行实现 CHM 二进制）。
+# CHM 内只含「画廊 HTML + 封面图」，纯展示（不含任何外部播放器调用）。
+# --------------------------------------------------------------------------
+CHM_GALLERY_TEMPLATE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="___CHARSET___">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电影封面画廊（___COUNT___）</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+.topbar { padding: 12px 18px; background: #1f2933; color: #fff; }
+.topbar h1 { margin: 0; font-size: 17px; }
+.topbar p { margin: 4px 0 0; font-size: 12px; opacity: .8; word-break: break-all; }
+.tocnav { padding: 10px 18px; background: #eef1f5; border-bottom: 1px solid #e3e6ea; }
+.tocnav-h { font-size: 12px; font-weight: 600; color: #6b7280; margin-bottom: 6px; }
+.tocnav ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 10px; }
+.tocnav li { font-size: 12px; }
+.tocnav a { color: #1d4ed8; text-decoration: none; }
+.tocnav a:hover { text-decoration: underline; }
+.folder { padding: 14px 18px 4px; font-size: 14px; font-weight: 600; color: #374151; border-bottom: 1px solid #e3e6ea; margin-top: 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; padding: 16px 18px; align-items: start; }
+.card { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+/* 图片容器：保持原始比例，绝不拉伸变形；用 contain 完整显示，黑底留边 */
+.imgwrap { width: 100%; background: #111; overflow: hidden; line-height: 0; }
+.card img { width: 100%; height: auto; display: block; }
+.card .nocover { width: 100%; min-height: 130px; display: flex; align-items: center; justify-content: center; background: #e9edf2; color: #9aa3af; font-size: 13px; line-height: 1.4; padding: 10px; }
+.meta { padding: 9px 11px; }
+.name { font-weight: 600; font-size: 13px; word-break: break-all; }
+.path { font-size: 11px; color: #6b7280; margin-top: 3px; word-break: break-all; }
+</style></head>
+<body>
+<div class="topbar"><h1>电影封面画廊</h1><p>共 ___COUNT___ 个视频 · 生成于 ___GEN___ · 扫描目录：___ROOT___</p></div>
+<nav class="tocnav"><div class="tocnav-h">目录导航（点左侧目录树或下方链接跳转）</div><ul>___NAV___</ul></nav>
+___BODY___
+</body></html>"""
 
-    返回 (httpd, port)。画廊通过 http://127.0.0.1:port/<gallery_name> 访问
-    （gallery_name 默认 gallery.html，GUI 模式会传入带目录信息的实际文件名）。
-    提供端点：
-      /thumb?path=<视频绝对路径>         -> 返回该视频的 .thumb.jpg 缩略图
-      /video?path=<视频绝对路径>         -> 返回原视频（支持 Range，可在弹窗中播放/拖拽）
-      /open-explorer?path=<目录绝对路径> -> 调用系统文件浏览器打开该目录
+
+def _safe_cover_name(video_path):
+    """用视频路径的哈希生成唯一、合法的封面文件名（避免中文/特殊字符冲突）。"""
+    h = hashlib.md5(os.path.abspath(video_path).encode("utf-8")).hexdigest()[:16]
+    return h + ".jpg"
+
+
+def build_chm_gallery(videos, work_dir, root, charset="utf-8", body_encoding="utf-8"):
+    """生成 CHM 专用画廊：把封面拷进 work_dir/covers/，返回 (画廊HTML路径, 目录索引表)。
+
+    每张卡片只展示封面图 + 文件名/路径（不再内置任何外部播放器调用）。
+    封面以相对路径 covers/<hash>.jpg 引用，chmcmd/hhc 会一并打进 CHM。
+
+    返回的 目录索引表 形如 { 绝对目录路径: sec序号 }，供 _build_chm_toc 生成
+    左侧保留原始目录结构的导航栏（每个目录指向 gallery.html#secN 锚点）。
+
+    charset / body_encoding 由 build_chm 按系统代码页决定（中文系统 GBK/Codepage=936，
+    UTF-8 Beta 系统 UTF-8/Codepage=65001）；写出时 errors="ignore" 丢弃无法编码的字符。
     """
-    out_dir = os.path.abspath(out_dir)
+    root_abs = os.path.abspath(root)
+    covers_dir = os.path.join(work_dir, "covers")
+    os.makedirs(covers_dir, exist_ok=True)
+    # 封面可能本身是 webp 等格式，转 CHM 时统一转成真正的 jpg（无 ffmpeg 则原样复制）
+    ffmpeg = find_ffmpeg()
 
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):  # 静默访问日志
-            pass
+    # 按所在文件夹分组，便于在 CHM 里分节浏览
+    groups = {}
+    for v in videos:
+        d = os.path.dirname(os.path.abspath(v))
+        groups.setdefault(d, []).append(v)
 
-        def _ct_for(self, path):
-            ext = os.path.splitext(path)[1].lower()
-            return {
-                ".mp4": "video/mp4", ".mkv": "video/x-matroska",
-                ".webm": "video/webm", ".mov": "video/quicktime",
-                ".avi": "video/x-msvideo", ".m4v": "video/x-m4v",
-                ".ts": "video/mp4", ".ogv": "video/ogg",
-            }.get(ext, "application/octet-stream")
+    # 按相对路径排序，并为每个含视频的目录分配锚点序号（与 TOC 对应）
+    ordered_dirs = sorted(groups.keys(), key=lambda p: os.path.relpath(p, root_abs))
+    folder_index = {d: i for i, d in enumerate(ordered_dirs)}
 
-        def _serve_file(self, fpath, ctype, range_ok=True):
-            if not os.path.isfile(fpath):
-                self.send_error(404)
-                return
-            size = os.path.getsize(fpath)
-            rng = self.headers.get("Range") if range_ok else None
-            if rng and rng.startswith("bytes="):
+    sections = []
+    for d in ordered_dirs:
+        rel = os.path.relpath(d, root_abs)
+        rel = "" if rel == "." else rel
+        sec_id = folder_index[d]
+        rows = []
+        for v in groups[d]:
+            name = os.path.basename(v)
+            thumb_src = _thumb_path_for_video(v)
+            cover_name = _safe_cover_name(v)
+            cover_dst = os.path.join(covers_dir, cover_name)
+            if os.path.isfile(thumb_src):
                 try:
-                    spec = rng[len("bytes="):].split(",")[0].strip()
-                    s, e = spec.split("-")
-                    start = int(s) if s else 0
-                    end = int(e) if e else size - 1
-                    if end >= size:
-                        end = size - 1
-                    if start > end:
-                        raise ValueError
-                    length = end - start + 1
-                    self.send_response(206)
-                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-                    self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Content-Length", str(length))
-                    self.send_header("Content-Type", ctype)
-                    self.end_headers()
-                    with open(fpath, "rb") as f:
-                        f.seek(start)
-                        self.wfile.write(f.read(length))
-                    return
-                except Exception:  # noqa: BLE001 - 回退到整文件
-                    pass
-            self.send_response(200)
-            self.send_header("Content-Length", str(size))
-            self.send_header("Content-Type", ctype)
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-            with open(fpath, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
-
-        def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
-            qs = urllib.parse.parse_qs(parsed.query)
-            if path == "/":
-                self._serve_file(
-                    os.path.join(self.server.out_dir, self.server.gallery_name),
-                    "text/html; charset=utf-8", range_ok=False)
-            elif path.endswith(".html"):
-                # 同一输出目录内可能有多份画廊（不同扫描目录），按文件名直接服务；
-                # 仅允许文件名本身，禁止路径穿越。
-                fname = path[1:]
-                if "/" in fname or "\\" in fname:
-                    self.send_error(400)
-                    return
-                self._serve_file(
-                    os.path.join(self.server.out_dir, fname),
-                    "text/html; charset=utf-8", range_ok=False)
-            elif path == "/thumb":
-                p = qs.get("path", [""])[0]
-                if p:
-                    self._serve_file(p + ".thumb.jpg", "image/jpeg", range_ok=False)
-                else:
-                    self.send_error(400)
-            elif path == "/video":
-                p = qs.get("path", [""])[0]
-                if p:
-                    self._serve_file(p, self._ct_for(p))
-                else:
-                    self.send_error(400)
-            elif path == "/open-explorer":
-                p = qs.get("path", [""])[0]
-                ok = False
-                if p and os.path.isdir(p):
-                    try:
-                        if sys.platform == "win32":
-                            subprocess.run(
-                                ["explorer.exe", "/select,", p],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                        elif sys.platform == "darwin":
-                            subprocess.run(["open", p])
-                        else:
-                            subprocess.run(["xdg-open", p])
-                        ok = True
-                    except Exception:  # noqa: BLE001
-                        ok = False
-                self.send_response(200)
-                body = b"ok" if ok else b"err"
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path == "/play":
-                # 唤起本机 PotPlayer 播放指定视频文件（传入完整路径）
-                p = qs.get("path", [""])[0]
-                if not p or not os.path.isfile(p):
-                    self.send_error(404)
-                    return
-                player = find_player()
-                if not player:
-                    # 本机没装播放器：返回 noplayer，由前端兜底用浏览器 <video>
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", "8")
-                    self.end_headers()
-                    self.wfile.write(b"noplayer")
-                    return
-                try:
-                    if sys.platform == "win32":
-                        subprocess.Popen(
-                            [player, p],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                    else:
-                        subprocess.Popen(
-                            [player, p],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                    ok = True
+                    _convert_image_to_jpg(thumb_src, cover_dst, ffmpeg)
+                    img = f'<div class="imgwrap"><img src="covers/{cover_name}" alt="{html.escape(name)}"></div>'
                 except Exception:  # noqa: BLE001
-                    ok = False
-                self.send_response(200)
-                body = b"ok" if ok else b"err"
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                    img = '<div class="imgwrap"><div class="nocover">无封面</div></div>'
             else:
-                self.send_error(404)
+                img = '<div class="imgwrap"><div class="nocover">无封面</div></div>'
+            rows.append(
+                f'<div class="card">{img}'
+                f'<div class="meta"><div class="name" title="{html.escape(v)}">'
+                f'{html.escape(name)}</div>'
+                f'<div class="path">{html.escape(v)}</div></div>'
+                f'</div>'
+            )
+        heading = "全部视频" if rel == "" else html.escape(rel)
+        # 每个目录区块加锚点 id=secN，左侧导航栏据此跳转
+        sections.append(
+            f'<div class="folder" id="sec{sec_id}">{heading}（{len(groups[d])}）</div>'
+            f'<div class="grid">{"".join(rows)}</div>'
+        )
 
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-    httpd.out_dir = out_dir
-    httpd.gallery_name = gallery_name
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, httpd.server_address[1]
+    # 页内目录导航（兜底）：即使 CHM 左侧目录树不可用，也能在正文里跳转
+    nav_items = []
+    for d in ordered_dirs:
+        rel = os.path.relpath(d, root_abs)
+        rel = "" if rel == "." else rel
+        label = "全部视频" if rel == "" else rel
+        nav_items.append(
+            '<li><a href="#sec%d">%s</a>（%d）</li>'
+            % (folder_index[d], html.escape(label), len(groups[d]))
+        )
+    nav_html = "\n".join(nav_items)
+
+    body = "\n".join(sections)
+    doc = (
+        CHM_GALLERY_TEMPLATE
+        .replace("___CHARSET___", charset)
+        .replace("___NAV___", nav_html)
+        .replace("___BODY___", body)
+        .replace("___COUNT___", str(len(videos)))
+        .replace("___ROOT___", html.escape(root_abs, quote=True))
+        .replace("___GEN___", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    gallery_html = os.path.join(work_dir, "gallery.html")
+    # 正文按 GBK（或 UTF-8）写入，errors="ignore" 丢弃 GBK 无法表示的字符，
+    # 避免 'gbk' codec can't encode 崩溃（个别生僻/外文/emoji 字符会丢失，可接受）。
+    with open(gallery_html, "w", encoding=body_encoding, errors="ignore") as f:
+        f.write(doc)
+    return gallery_html, folder_index
 
 
-def run_server(out_dir, gallery_name, port=0, port_file=None):
-    """（供 GUI 后台独立进程使用）启动画廊 HTTP 服务并【永久阻塞】。
+def _build_chm_toc(folder_index, root, meta=""):
+    """根据 目录索引表 生成 CHM 目录文件(.hhc)内容：镜像原始文件夹结构。
 
-    与 serve_gallery 不同，本函数不返回，直接 serve_forever，便于被一个
-    「脱离父进程」的子进程运行——即使 GUI 窗口关闭、主进程退出，服务也能
-    在后台继续运行（支撑已打开画廊页面里的左键点击播放 /play 等端点）。
-    port_file 非空时，把实际绑定的端口写进该文件，供父进程（GUI）回读。
+    meta 为写入 <HEAD> 的编码声明（如 '<meta charset="utf-8">'），
+    用于告诉编译器 .hhc 里的目录名是什么编码，避免中文在导航栏乱码。
+
+    - 含视频的目录：作为可点击主题，Local 指向 gallery.html#secN（锚点跳转）。
+    - 中间目录（仅作为路径容器）：作为书节点（无 Local），可展开/收起。
+    - 根目录：指向 gallery.html 顶部。
     """
-    httpd, bound_port = serve_gallery(out_dir, port=port, gallery_name=gallery_name)
-    if port_file:
-        try:
-            with open(port_file, "w", encoding="utf-8") as f:
-                f.write(str(bound_port))
-        except Exception:  # noqa: BLE001 - 写端口失败不影响服务本身
-            pass
-    print(f"serving gallery at http://127.0.0.1:{bound_port}/{gallery_name}")
+    root_abs = os.path.abspath(root)
+    tree = {}
+    for d in folder_index:
+        rel = os.path.relpath(d, root_abs)
+        parts = [] if rel == "." else rel.split(os.sep)
+        node = tree
+        for p in parts:
+            node = node.setdefault(p, {})
+
+    def rel_to_abs(parts):
+        return root_abs if not parts else os.path.join(root_abs, *parts)
+
+    def render(parts):
+        node = tree
+        for p in parts:
+            node = node[p]
+        items = []
+        for name in sorted(node.keys()):
+            child_parts = parts + [name]
+            child_abs = rel_to_abs(child_parts)
+            sub = render(child_parts)
+            if child_abs in folder_index:
+                local = "gallery.html#sec%d" % folder_index[child_abs]
+                obj = (
+                    '<OBJECT type="text/sitemap">'
+                    '<param name="Name" value="%s">'
+                    '<param name="Local" value="%s"></OBJECT>'
+                    % (html.escape(name), local)
+                )
+            else:
+                obj = (
+                    '<OBJECT type="text/sitemap">'
+                    '<param name="Name" value="%s"></OBJECT>'
+                    % html.escape(name)
+                )
+            items.append("<LI>" + obj + (sub if sub else "") + "</LI>")
+        return ("<UL>\n" + "\n".join(items) + "\n</UL>") if items else ""
+
+    root_name = os.path.basename(root_abs.rstrip(os.sep)) or root_abs
+    root_obj = (
+        '<OBJECT type="text/sitemap">'
+        '<param name="Name" value="%s">'
+        '<param name="Local" value="gallery.html"></OBJECT>'
+        % html.escape(root_name)
+    )
+    inner = render([])
+    return (
+        '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">\n'
+        '<HTML><HEAD>' + meta + '</HEAD><BODY>\n<UL>\n'
+        '<LI>' + root_obj + (inner if inner else "") + '</LI>\n'
+        '</UL>\n</BODY></HTML>'
+    )
+
+
+def chm_filename_for(root):
+    """根据扫描目录生成唯一的 CHM 文件名（与 gallery_filename_for 同规则）。"""
+    p = os.path.abspath(root)
+    token = p.replace(":", "").replace("\\", "_").replace("/", "_")
+    token = re.sub(r'[*?"<>|]', "", token).strip().strip(".")
+    if not token:
+        token = "root"
+    if len(token) > 100:
+        token = token[:100] + "_" + hashlib.md5(p.encode("utf-8")).hexdigest()[:8]
+    return "gallery_" + token + ".chm"
+
+
+def _get_ansi_codepage():
+    """返回系统 ANSI 代码页（GetACP），用于决定 CHM 的编码配对。
+
+    常见值：936=简体中文(GBK)，950=繁体中文，932=日文，65001=Windows“UTF-8 Beta”。
+    """
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetACP())
+    except Exception:  # noqa: BLE001
         try:
-            httpd.shutdown()
+            import locale
+            enc = (locale.getpreferredencoding() or "").lower()
+            if "65001" in enc or "utf-8" in enc or "utf8" in enc:
+                return 65001
         except Exception:  # noqa: BLE001
             pass
-        httpd.server_close()
+        return 936
+
+
+def build_chm(videos, out_dir, root):
+    """把画廊编译成 .chm，返回 .chm 绝对路径。
+
+    编译器：优先 hhc.exe（微软官方，能编译出真正的左侧目录树/导航栏）；
+    回退 chmcmd.exe（开源，但本构建不出目录树，仅作兜底、保证正文不乱码）。
+    若两者都找不到，抛出 FileNotFoundError 并附带安装/配置指引。
+    """
+    # 优先 hhc（能出真正的目录树/导航栏）；兜底 chmcmd（本构建不出 TOC，但正文可正确）
+    hhc = find_hhc()
+    chmcmd = find_chmcmd()
+    compiler = hhc or chmcmd
+    if not compiler:
+        raise FileNotFoundError(
+            "未找到 CHM 编译器（hhc.exe 或 chmcmd.exe）。任选其一即可：\n"
+            "  1) 用 Microsoft HTML Help Workshop（推荐，左侧目录树/导航栏最稳）：\n"
+            "     从 GitHub 下载便携包并解压：\n"
+            "       https://github.com/skywind3000/support/releases/download/1.0.0/htmlhelp.zip\n"
+            "     把里面的 hhc.exe / hha.dll / itcc.dll 三个文件放到本应用 tools/ 下；\n"
+            "     首次用请以管理员运行一次 tools/register_hhw.bat 完成 COM 注册。\n"
+            "  2) 或下载开源 chmcmd（免注册、不依赖 itircl/itcc，但本版无目录树，仅兜底）：\n"
+            "     https://github.com/skywind3000/support/releases/download/1.0.0/chmcmd.zip\n"
+            "     解压后把 chmcmd.exe 放到本应用目录的 tools/ 下即可。\n"
+            "  3) 设置环境变量 HHC_PATH / CHMCMD_PATH 指向对应 exe 的绝对路径。\n"
+            "完成后重新点击「打包成 CHM」即可。"
+        )
+
+    # ---- 导航栏/正文编码（关键）----
+    # HTML Help 查看器用【CHM 自身声明的 Codepage】来解码：
+    #   (a) 左侧目录树(TOC) 的字符串表(#STRINGS)；
+    #   (b) 各 HTML 正文的字节（与 <meta> 冲突时多数版本以 CHM 代码页为准）。
+    # 故“写入 .hhc / .html 的字节编码”必须与“声明的 Codepage”严格配对。
+    # hhc 4.74 是 ANSI 程序，实测在中文系统上 GBK + Codepage=936 时导航栏中文
+    # 最稳；UTF-8 + Codepage=65001 反而会让中文导航栏乱码，故默认走 GBK。
+    # 代价：GBK 无法表示中文/ASCII 之外的字符（西里尔字母、emoji 等）。为避免
+    # Python 写入时抛 'gbk' codec can't encode，所有写出统一用 errors="ignore"
+    # 直接丢弃这些无法编码的字符（文件名/目录名里的个别生僻字符会少掉，可接受）。
+    acp = _get_ansi_codepage()
+    if acp == 65001:
+        hhc_encoding = "utf-8-sig"
+        toc_meta = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+        codepage_line = "Codepage=65001\n"
+        body_charset, body_encoding = "utf-8", "utf-8"
+    else:
+        hhc_encoding = "gbk"
+        toc_meta = '<meta http-equiv="Content-Type" content="text/html; charset=gb2312">'
+        codepage_line = "Codepage=936\n"
+        body_charset, body_encoding = "gb2312", "gbk"
+
+    os.makedirs(out_dir, exist_ok=True)
+    # 中间产物放到系统临时目录。hhc 4.74 是 ANSI 程序，读中文路径会乱码（HHC5010），
+    # 故先编译到 ASCII 临时名，成功后再重命名；.hhp 本身也用 UTF-8 写（仅含 ASCII 路径）。
+    import tempfile
+    work_dir = tempfile.mkdtemp(prefix="chm_build_")
+
+    gallery_html, folder_index = build_chm_gallery(
+        videos, work_dir, root, charset=body_charset, body_encoding=body_encoding
+    )
+
+    # 收集封面文件（相对工作目录，反斜杠，编译器识别）
+    cover_files = []
+    covers_dir = os.path.join(work_dir, "covers")
+    if os.path.isdir(covers_dir):
+        for fn in sorted(os.listdir(covers_dir)):
+            if fn.lower().endswith(".jpg"):
+                cover_files.append("covers\\" + fn)
+
+    chm_name = chm_filename_for(root)
+    chm_out = os.path.join(out_dir, chm_name)
+
+    compiled_tmp = os.path.join(work_dir, "compiled.chm")
+
+    # 目录文件（.hhc）：镜像原始视频目录结构的导航栏（与 CHM 代码页同编码写入）。
+    # errors="ignore" 同样丢弃 GBK 无法表示的字符，避免导航栏里的外文目录名导致崩溃。
+    toc = _build_chm_toc(folder_index, root, meta=toc_meta)
+    toc_path = os.path.join(work_dir, "toc.hhc")
+    with open(toc_path, "w", encoding=hhc_encoding, errors="ignore") as f:
+        f.write(toc)
+
+    # 项目文件（.hhp）：仅含 ASCII 路径与 Codepage 指令，用 UTF-8 写最稳。
+    files_block = "gallery.html\n" + "".join(c + "\n" for c in cover_files)
+    hhp = (
+        "[OPTIONS]\n"
+        "Compatibility=1.1\n"
+        "Compiled file=" + compiled_tmp + "\n"
+        "Contents file=toc.hhc\n"
+        "Default topic=gallery.html\n"
+        "Display compile progress=No\n"
+        + codepage_line +
+        "Language=0x804\n\n"
+        "[FILES]\n" + files_block
+    )
+    hhp_path = os.path.join(work_dir, "project.hhp")
+    with open(hhp_path, "w", encoding="utf-8") as f:
+        f.write(hhp)
+
+    # 依次尝试编译器：优先 hhc（能出真正的目录树/导航栏），失败则回退 chmcmd
+    # （免注册、不依赖 itircl/itcc）。若 hhc 因 itcc.dll/itircl 缺失或
+    # 未注册(HHC6003 / compiler object)而失败，自动回退到 chmcmd，避免硬失败。
+    compilers = []
+    if hhc:
+        compilers.append(("hhc", hhc))
+    if chmcmd:
+        compilers.append(("chmcmd", chmcmd))
+
+    last_err = None
+    for kind, comp in compilers:
+        if kind == "hhc":
+            _ensure_hhw_registered(hhc)  # 注册 itcc/itircl（hha 由 hhc 直接加载，无需注册），失败静默（会回退到 chmcmd）
+            cmd = [comp, hhp_path]
+        else:
+            cmd = [comp, "--no-html-scan", hhp_path]
+        run_kwargs = dict(
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=work_dir,
+        )
+        if sys.platform == "win32":
+            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(cmd, **run_kwargs)
+        except Exception as e:  # noqa: BLE001
+            last_err = "调用 %s 失败：%s" % (kind, e)
+            continue
+
+        out_txt = (proc.stdout or b"").decode("utf-8", "replace")
+        err_txt = (proc.stderr or b"").decode("utf-8", "replace")
+        log = out_txt + "\n" + err_txt
+
+        if not os.path.isfile(compiled_tmp):
+            last_err = "【%s】未生成 CHM。\n%s\n%s" % (kind, out_txt[:800], err_txt[:800])
+            if kind == "hhc" and "HHC6003" in log:
+                last_err += (
+                    "\n\n（hhc 报 HHC6003：itcc.dll / itircl.dll 未注册或缺失。"
+                    "已自动回退到 chmcmd。请以管理员运行一次 tools/register_hhw.bat，"
+                    "或把 htmlhelp.zip 里的 itcc.dll 放到 tools/ 下后再试。）"
+                )
+            continue
+
+        # hhc 在 HHC6003 时仍写出空壳（有 ITSF 头但内容缺失），须看日志判定后回退
+        if kind == "hhc" and ("HHC6003" in log or "were not compiled" in log.lower()):
+            last_err = "【hhc】内容未编入（多半 itircl.dll 未注册）。\n%s\n%s" % (
+                out_txt[:800], err_txt[:800])
+            continue
+
+        break  # 编译成功
+    else:
+        raise RuntimeError(
+            "CHM 编译失败（已尝试：%s）。\n%s\n\n建议修复编译器：\n"
+            "  hhc 需要 tools/ 下有 hha.dll（直接加载）+ itcc.dll（需注册）；\n"
+            "  管理员运行一次 tools/register_hhw.bat 即可注册 itcc/itircl；\n"
+            "  itcc.dll/hha.dll 可从便携包取："
+            "https://github.com/skywind3000/support/releases/download/1.0.0/htmlhelp.zip\n"
+            "  或改用免注册的 chmcmd："
+            "https://github.com/skywind3000/support/releases/download/1.0.0/chmcmd.zip"
+            % (", ".join(k for k, _ in compilers) or "无", last_err or "")
+        )
+
+    # 编译成功：把 ASCII 临时文件重命名为最终文件名（可含中文），并清理临时目录
+    if os.path.abspath(compiled_tmp) != os.path.abspath(chm_out):
+        if os.path.isfile(chm_out):
+            os.remove(chm_out)
+        shutil.move(compiled_tmp, chm_out)
+    shutil.rmtree(work_dir, ignore_errors=True)
+
+    # 终检：产物必须是合法 CHM（ITSF 头）
+    with open(chm_out, "rb") as _f:
+        if _f.read(4) != b"ITSF":
+            raise RuntimeError("生成的文件不是合法 CHM（缺少 ITSF 头）。")
+
+    return chm_out
 
 
 def launch_server_subprocess(out_dir, gallery_name, port_file):
-    """启动一个【脱离父进程】的后台画廊服务子进程，返回 Popen 对象。
+    """启动【脱离父进程】的后台画廊服务（独立的 gallery_server.py），返回 (proc, port)。
 
-    out_dir / gallery_name 会传给子进程；子进程自己选空闲端口（port=0），
-    并把端口写入 port_file 供调用方回读。
+    返回值为元组：
+      - proc：新启动的子进程 Popen；若同名端口已有服务在跑（上一次脱离父进程
+              残留的、或用户手动启动的独立 gallery_server.py），则为 None（复用）。
+      - port：服务实际绑定的端口（固定默认 8765，或环境变量 VTL_GALLERY_PORT）。
+
     仅在 Windows 上追加 DETACHED_PROCESS | CREATE_NO_WINDOW，使其彻底独立于
     GUI 父进程且不可见（父进程退出后子进程继续存活）。
     """
-    script = os.path.abspath(__file__)
-    cmd = [sys.executable, script, "--serve", out_dir,
-           "--name", gallery_name, "--port", "0", "--port-file", port_file]
+    port = gallery_server_port()
+    # 端口已被占用（多半是已存在的服务）：直接复用，不再重复启动，并写回 port_file。
+    if is_server_up(port):
+        try:
+            with open(port_file, "w", encoding="utf-8") as f:
+                f.write(str(port))
+        except Exception:  # noqa: BLE001
+            pass
+        return (None, port)
+
+    server_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "gallery_server.py")
+    cmd = [sys.executable, server_script, "--dir", out_dir,
+           "--name", gallery_name, "--port", str(port), "--port-file", port_file]
     flags = 0
     if sys.platform == "win32":
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=flags,
     )
+    return (proc, port)
 
 
 def main():
@@ -1107,23 +1634,25 @@ def main():
     ap.add_argument("--ffmpeg", default=None, help="ffmpeg 可执行文件路径（找不到时自动搜索）")
     ap.add_argument("--force", action="store_true",
                    help="强制重新生成所有首帧截图（忽略已存在的缓存）")
+    ap.add_argument("--chm", action="store_true",
+                   help="扫描完成后额外把画廊打包成 .chm（需本机安装 HTML Help Workshop 的 hhc.exe）")
     ap.add_argument("--serve", action="store_true",
-                   help="仅启动本地画廊服务并常驻（供 GUI 后台独立运行，不扫描）")
+                   help="仅启动本地画廊服务并常驻（等价于直接运行 gallery_server.py）")
     ap.add_argument("--name", default="gallery.html",
                    help="--serve 模式下的画廊文件名（默认 gallery.html）")
-    ap.add_argument("--port", type=int, default=0,
-                   help="--serve 模式绑定的端口（0=系统自动选空闲端口）")
+    ap.add_argument("--port", type=int, default=None,
+                   help="--serve 模式绑定的端口（默认 8765，或环境变量 VTL_GALLERY_PORT）")
     ap.add_argument("--port-file", default=None,
                    help="--serve 模式下把实际绑定端口写入该文件（供调用方回读）")
     args = ap.parse_args()
 
     if args.serve:
-        # 后台常驻服务模式：不扫描，仅起 HTTP 服务并阻塞
+        # 后台常驻服务模式（与直接运行 gallery_server.py 等价）
         if not args.directory or not os.path.isdir(args.directory):
             print("错误：--serve 需要指定一个已存在的输出目录（用法：--serve <out_dir>）",
                   file=sys.stderr)
             sys.exit(1)
-        run_server(args.directory, args.name, args.port, args.port_file)
+        run_server(args.directory, args.name, gallery_server_port(args.port), args.port_file)
         return
 
     directory = args.directory
@@ -1152,7 +1681,7 @@ def main():
     hit = find_cached_gallery(out_dir, directory)
     if hit and not args.force:
         print(f"该目录此前已扫描过，直接打开已有画廊：{hit}")
-        webbrowser.open(file_url(hit))
+        reveal_in_explorer(hit)
         return
 
     print(f"正在扫描：{directory}")
@@ -1172,7 +1701,7 @@ def main():
         cover = _find_cover(v)
         if cover is not None:
             try:
-                shutil.copy2(cover, out_jpg)
+                _convert_image_to_jpg(cover, out_jpg, ffmpeg)
                 cover_used += 1
                 print(f"  (封面) ({i}/{len(videos)}) {name}  <-  {os.path.basename(cover)}", flush=True)
             except Exception as e:  # noqa: BLE001
@@ -1193,10 +1722,17 @@ def main():
     build_gallery(videos, out_html, directory)
     save_scan_log_entry(out_dir, directory, os.path.basename(out_html), len(videos))
 
+    if args.chm:
+        try:
+            chm_path = build_chm(videos, out_dir, directory)
+            print(f"CHM 已生成：{chm_path}")
+        except Exception as e:  # noqa: BLE001 - CHM 失败不应影响画廊本身
+            print(f"CHM 打包失败：{e}", file=sys.stderr)
+
     print(f"\n完成：抽帧 {ok}，用封面 {cover_used}，复用缓存 {cached}，失败 {fail}")
     if fail:
         print(f"失败明细已写入日志：{err_log}")
-    print(f"画廊（用浏览器打开）：{out_html}")
+    print(f"画廊已生成（在文件资源管理器中打开）：{out_html}")
 
 
 if __name__ == "__main__":
