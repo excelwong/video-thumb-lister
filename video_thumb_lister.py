@@ -109,52 +109,6 @@ def find_ffmpeg(explicit=None):
     return None
 
 
-# 本地播放器：仅使用 PotPlayer（左键点击缩略图时唤起本机 PotPlayer 播放）。
-# 优先 PotPlayerMini64.exe（免安装/便携版，无需注册表），其次 PotPlayer64.exe / PotPlayer.exe。
-# 含「免管理员」的便携版安装位置（本应用解压到用户目录的 PotPlayer）。
-_PLAYER_PORTABLE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local")),
-    "Programs", "PotPlayer")
-PLAYER_CANDIDATES = [
-    # 本应用解压的便携版（优先 mini 64 位）
-    os.path.join(_PLAYER_PORTABLE_DIR, "PotPlayerMini64.exe"),
-    os.path.join(_PLAYER_PORTABLE_DIR, "PotPlayer64.exe"),
-    # 常见安装位置
-    r"C:/Program Files/PotPlayer/PotPlayerMini64.exe",
-    r"C:/Program Files/PotPlayer/PotPlayer64.exe",
-    r"C:/Program Files/PotPlayer/PotPlayer.exe",
-    r"C:/Program Files (x86)/PotPlayer/PotPlayer.exe",
-    r"C:/PotPlayer/PotPlayer.exe",
-    # PATH 中的可执行文件
-    "PotPlayerMini64.exe",
-    "PotPlayer64.exe",
-    "PotPlayer.exe",
-]
-
-
-def find_player():
-    """返回本机可用的 PotPlayer 可执行文件路径；找不到返回 None。"""
-    for c in PLAYER_CANDIDATES:
-        if os.path.isfile(c):
-            return c
-    # PATH 兜底
-    for name in ("PotPlayerMini64.exe", "PotPlayer64.exe", "PotPlayer.exe"):
-        p = shutil.which(name)
-        if p:
-            return p
-    # 便携版可能解压出带版本号的子目录，做一次递归兜底
-    try:
-        import glob as _glob
-        base = os.path.dirname(_PLAYER_PORTABLE_DIR)
-        for pat in (os.path.join(base, "**", "PotPlayerMini64.exe"),
-                    os.path.join(base, "**", "PotPlayer64.exe"),
-                    os.path.join(base, "**", "PotPlayer.exe")):
-            hits = _glob.glob(pat, recursive=True)
-            if hits:
-                return hits[0]
-    except Exception:  # noqa: BLE001
-        pass
-    return None
 
 
 def _read_reg_sz(root, subkey, value=None):
@@ -1014,24 +968,13 @@ document.getElementById('q').addEventListener('input', function(){
 </script>
 <script>
 function openFallback(url){
-  // 本机没装 PotPlayer 时的兜底：浏览器内 <video> 弹窗
-  var w = window.open('', 'vplayer', 'width=960,height=600');
-  if(!w){ alert('浏览器拦截了弹窗，请允许本页面弹出窗口后重试。'); return; }
-  w.document.open();
-  w.document.write(
-    '<!doctype html><html><head><meta charset="utf-8"><title>播放</title></head>' +
-    '<body style="margin:0;background:#000;height:100vh;display:flex;align-items:center;justify-content:center">' +
-    '<video controls autoplay src="' + url + '" style="max-width:100%;max-height:100%"></video>' +
-    '</body></html>'
-  );
-  w.document.close();
+  // 无法经画廊服务唤起本机默认播放器时的兜底：提示用户（不再在浏览器内联播放）。
+  alert('无法打开视频播放：请确认画廊服务（gallery_server.py）正在运行，且本机已设置默认视频播放器。');
 }
-// 浏览器原生可内联播放的格式（无需外部播放器）；其余格式都必须交给本机 PotPlayer
-var NATIVE_EXT = {'.mp4':1, '.webm':1, '.ogv':1, '.m4v':1, '.mov':1, '.mkv':1};
 function openPlayer(url){
-  // 始终通过独立的 gallery_server.py（SERVER_BASE）调起本机 PotPlayer，
-  // 支持【所有格式】（含 avi / rmvb / flv / ts / vob / wmv / mpg 等浏览器放不了的），
-  // 因此任何后缀都【直接播放、不会变成下载】。
+  // 始终通过独立的 gallery_server.py（SERVER_BASE）调起本机【默认视频播放器】
+  // （如 PotPlayer，由系统文件关联决定），支持【所有格式】，
+  // 因此任何后缀都直接交给本机播放器、不会在浏览器内播放或变成下载。
   // url 形如 SERVER_BASE + '/video?path=<encoded 绝对路径>'
   var abs = '';
   try {
@@ -1042,15 +985,14 @@ function openPlayer(url){
   fetch(SERVER_BASE + '/play?path=' + encodeURIComponent(abs))
     .then(function(r){ return r.text(); })
     .then(function(t){
-      if (t === 'noplayer') { openFallback(url); }
-      else if (t === 'err') { alert('调用播放器失败，请确认本机已安装 PotPlayer。'); }
-      // 'ok' 表示已交由 PotPlayer 播放
+      if (t === 'err') { alert('调用播放器失败，请确认本机已设置默认视频播放器。'); }
+      // 'ok' 表示已交由本机默认播放器（如 PotPlayer）打开并播放
     })
     .catch(function(){
       var last = Math.max(abs.lastIndexOf('/'), abs.lastIndexOf(String.fromCharCode(92)));
       var dir = last > 0 ? abs.slice(0, last) : abs;
       window.open('file:///' + dir);
-      alert('未能连接画廊服务（gallery_server.py）。已为你打开视频所在文件夹，请用本机 PotPlayer 双击播放。');
+      alert('未能连接画廊服务（gallery_server.py）。已为你打开视频所在文件夹，请用本机默认播放器双击播放。');
     });
 }
 </script>
