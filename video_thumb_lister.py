@@ -28,9 +28,9 @@ video_thumb_lister.py
       完全跳过抽帧；缓存是否失效也以封面图的修改时间为准（视频改动不再触发重抽，
       封面被替换才重抽）。封面匹配规则：
         * 完全同名优先：a.mp4 -> a.jpg / a.png …；
-        * 其次按「核心番号」匹配：剥离视频名末尾的版本后缀（-U/-C/-UC/-CU、末尾 R）
+        * 其次按「核心番号」匹配：剥离视频名末尾的版本后缀（-U/-C/-UC/-WC、末尾 R）
           后再找图，故封面 ABC-123.jpg 可用于 ABC-123.mp4 / ABC-123R.mp4 /
-          ABC-123-U.mp4 / ABC-123-C.mp4 / ABC-123-UC.mp4。
+          ABC-123-U.mp4 / ABC-123-C.mp4 / ABC-123-UC.mp4 / ABC-123-WC.mp4。
 ====================================================================
 """
 
@@ -667,19 +667,21 @@ def _thumb_path_for_video(video_path):
 
 
 # 视频名相对「核心番号」可能带的版本后缀（不区分大小写）：
-#   -U / -C / -UC / -CU （去码 / 中文字幕 等标记，带连字符）
+#   -U / -C / -UC / -WC （去码 / 中文字幕 等标记，带连字符）
 #   末尾单独的 R          （流出/修正版等标记，直接附着，无连字符）
 # 例：核心番号 ABC-123 的封面 ABC-123.jpg，可用于
 #   ABC-123.mp4 / ABC-123R.mp4 / ABC-123-U.mp4 / ABC-123-C.mp4 / ABC-123-UC.mp4
-_COVER_TAIL_TAG = re.compile(r"-(?:U|C|UC|CU)$", re.IGNORECASE)
+#   / ABC-123-WC.mp4
+# ⚠️ 正则里 UC|WC 必须排在单个 U|C 之前，否则交替匹配会先命中 U 而漏掉 UC。
+_COVER_TAIL_TAG = re.compile(r"-(?:UC|WC|U|C)$", re.IGNORECASE)
 _COVER_TAIL_R = re.compile(r"R$", re.IGNORECASE)
 
 
 def _cover_core_candidates(base):
     """由视频名（不含扩展名）推导出可能的「封面核心名」候选列表。
 
-    先返回原名（精确匹配优先），再依次剥离末尾的 -U/-C/-UC/-CU 和 R，
-    使 ABC-123R / ABC-123-U / ABC-123-UC 等都能回退到核心名 ABC-123。
+    先返回原名（精确匹配优先），再依次剥离末尾的 -U/-C/-UC/-WC 和 R，
+    使 ABC-123R / ABC-123-U / ABC-123-UC / ABC-123-WC 等都能回退到核心名 ABC-123。
     按具体到宽泛排列，去重后返回。
     """
     cands = [base]
@@ -705,8 +707,8 @@ def _find_cover(video_path):
 
     匹配规则（按优先级）：
       1) 与视频完全同名的封面（a.mp4 -> a.jpg），最优先；
-      2) 剥离版本后缀（-U/-C/-UC/-CU、末尾 R）后的核心名封面，
-         如 ABC-123R.mp4 / ABC-123-U.mp4 -> ABC-123.jpg。
+      2) 剥离版本后缀（-U/-C/-UC/-WC、末尾 R）后的核心名封面，
+         如 ABC-123R.mp4 / ABC-123-U.mp4 / ABC-123-WC.mp4 -> ABC-123.jpg。
     对每个候选核心名再按 COVER_EXTS 顺序找图片，返回首个命中的完整路径；
     都找不到返回 None。
     """
