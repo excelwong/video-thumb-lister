@@ -1102,12 +1102,15 @@ ctx.addEventListener('click', function(e){
 function makeThumbUrl(thumb){ return SERVER_BASE + '/thumb?path=' + encodeURIComponent(thumb); }
 function makeVurl(p, fp){ return SERVER_BASE + '/video?path=' + encodeURIComponent(p); }
 
-// 初始化：根据打开方式（本地 file:// 双击 / 经本应用服务 http://）补全每张卡片的缩略图与播放链接
-// 关键：同一份 HTML 既能由本应用服务访问，也能直接双击打开。
-//   - file:// 模式（直接双击）：封面/视频都用本地 file:// 绝对路径，不依赖任何服务器；
-//   - http:// 模式（经 gallery_server）：封面走 /thumb、视频走 /video，并保留 file:// 兜底。
+// 初始化：每张卡片的缩略图走本应用本地服务 /thumb，点击走 /play 调起 PotPlayer。
+// 画廊服务（gallery_server.py）是【独立常驻进程】——只要本机曾运行过本应用，
+// 即使直接双击 .html（file://）打开，服务通常仍在运行，缩略图与 PotPlayer 都正常。
+// 因此这里【始终经由服务】，只有当服务确实不可达时才用 file:// 本地文件兜底：
+//   - 缩略图：onerror 退回同目录本地图片（仍可显示）；
+//   - 视频：openPlayer 的 fetch 失败会打开【所在文件夹】（交由用户用 PotPlayer 双击）。
+// 切勿把点击 href 直接写成 file:// 视频：浏览器会把 mp4/avi 当成下载或内联播放，
+// 无法唤起 PotPlayer；必须由服务 /play 端点在本机 spawn PotPlayer 进程。
 document.addEventListener('DOMContentLoaded', function(){
-  var served = (location.protocol === 'http:' || location.protocol === 'https:');
   function fileUrl(abs){ return 'file:///' + encodeURI((abs || '').replace(/\\/g, '/')); }
   document.querySelectorAll('.card').forEach(function(card){
     var p = card.dataset.path, fp = card.dataset.fpath;
@@ -1116,22 +1119,16 @@ document.addEventListener('DOMContentLoaded', function(){
     if (img) {
       var thumb = card.dataset.thumb || '';
       if (thumb) {
-        if (served) {
-          img.src = makeThumbUrl(thumb);
-          // 服务器不可用时（如服务已关闭）兜底用本地文件，保证仍能看到封面
-          img.onerror = function(){ this.onerror = null; this.src = fileUrl(thumb); };
-        } else {
-          // 直接双击打开：封面就是同目录图片，直接用 file:// 绝对路径，无需服务器
-          img.src = fileUrl(thumb);
-          // 极端情况下（如网络盘脱机）再尝试走服务器兜底
-          img.onerror = function(){ this.onerror = null; this.src = makeThumbUrl(thumb); };
-        }
+        // 先挂兜底，再设 src：服务不可达时退回同目录本地封面，保证仍能看到图。
+        img.onerror = function(){ this.onerror = null; this.src = fileUrl(thumb); };
+        img.src = makeThumbUrl(thumb);
       } else {
         img.style.display = 'none';
       }
     }
     if (a) {
-      a.href = served ? makeVurl(p, fp) : fileUrl(fp);
+      // 点击经由 openPlayer -> 服务 /play 调起本机 PotPlayer（任意格式均直接播放）。
+      a.href = makeVurl(p, fp);
     }
   });
 });
