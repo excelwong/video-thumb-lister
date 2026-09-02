@@ -296,19 +296,45 @@ class ThumbListerApp(tk.Tk):
         gdir = os.path.dirname(out_html)
         gname = os.path.basename(out_html)
         # 确保【独立后台服务】(gallery_server.py) 在运行：画廊里的缩略图、PotPlayer
-        # 播放、『打开文件浏览器』都依赖它。服务用固定端口（默认 8765），若已在线
-        # 则直接复用（可能是上次关闭 GUI 后残留的，或用户手动启动的独立进程）。
-        # 这样即使关闭 GUI 窗口、主进程退出，画廊仍可正常工作。
+        # 播放、『打开文件浏览器』都依赖它。服务用固定端口（默认 8765）。
+        # 注意：服务是【常驻进程】——本应用更新代码后，旧进程仍会占着端口跑旧逻辑
+        # （典型症状：新画廊缩略图 404 不显示）。因此复用在线服务前先用 /ping
+        # 探测其代码版本，版本不一致就自动结束并重启，用户无需手动处理。
         same_dir = bool(self.serve_out_dir and self.serve_out_dir == gdir)
         proc_running = (self.serve_proc is not None and self.serve_proc.poll() is None)
-        if not (proc_running and same_dir):
-            if proc_running and not same_dir:
-                # 旧服务托管的是别的目录，先停掉再起新的（避免目录错配）
+        reuse = False
+        port = None
+        if proc_running and same_dir:
+            port = self.serve_port
+            if vtl.server_version_matches(port):
+                reuse = True
+            else:
+                # 自家进程跑的是旧版本代码：结束它，走下面的重新启动
+                self._log("后台服务是旧版本（代码已更新），正在自动重启……")
                 try:
                     self.serve_proc.terminate()
                 except Exception:  # noqa: BLE001
                     pass
                 self.serve_proc = None
+                vtl.wait_port_free(port)
+        elif proc_running and not same_dir:
+            # 旧服务托管的是别的目录，先停掉再起新的（避免目录错配）
+            try:
+                self.serve_proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            self.serve_proc = None
+        else:
+            # 没有自家进程：端口上可能有上次 GUI 关闭后残留的服务
+            port = vtl.gallery_server_port()
+            if vtl.is_server_up(port):
+                if vtl.server_version_matches(port):
+                    reuse = True
+                else:
+                    self._log("检测到旧版本的后台服务残留，正在自动结束并重启……")
+                    vtl.stop_stale_server(port)
+                    vtl.wait_port_free(port)
+        if not reuse:
             port_file = os.path.join(
                 tempfile.gettempdir(), f"vtl_port_{os.getpid()}_{int(time.time())}.tmp")
             try:
@@ -328,10 +354,14 @@ class ThumbListerApp(tk.Tk):
             self.stop_btn.configure(state="normal")
             self._log(f"后台服务已就绪（独立进程 gallery_server.py，关闭窗口也会继续）："
                        f"http://127.0.0.1:{port}/{gname}")
+            # 起好后做一次版本自检：万一端口仍被杀不掉的旧服务占着，明确告知用户
+            if not vtl.server_version_matches(port):
+                self._log("警告：后台服务版本校验未通过（旧服务可能未能自动结束）。"
+                          "请在任务管理器里结束旧的 python 进程后重试，否则缩略图/播放可能异常。")
         else:
-            # 服务仍在运行且托管同一目录：直接复用
+            # 服务仍在运行且代码版本一致：直接复用
             self._log(f"复用已运行的后台服务："
-                       f"http://127.0.0.1:{self.serve_port}/{gname}")
+                       f"http://127.0.0.1:{port}/{gname}")
         # 生成后用【文件资源管理器】定位/选中该画廊文件，而不是用浏览器自动打开
         reveal_in_explorer(out_html)
 

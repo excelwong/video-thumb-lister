@@ -60,6 +60,7 @@ from gallery_server import (  # noqa: E402
     gallery_server_base,
     is_server_up,
     run_server,
+    SERVER_VERSION,
 )
 
 # 支持的视频扩展名（小写）
@@ -1697,6 +1698,103 @@ def launch_server_subprocess(out_dir, gallery_name, port_file):
         creationflags=flags,
     )
     return (proc, port)
+
+
+def server_version_matches(port=None):
+    """探测 127.0.0.1:port 上的画廊服务是否与【当前代码】同版本。
+
+    后台服务是常驻进程：本应用更新代码后，旧进程仍占着端口跑旧逻辑，
+    导致新画廊的 /thumb 请求 404（缩略图不见）。GUI 打开画廊前用它判断
+    是否需要自动重启服务。
+    """
+    port = gallery_server_port(port)
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/ping" % port, timeout=2) as r:
+            return r.read().decode("utf-8", "replace").strip() == str(SERVER_VERSION)
+    except Exception:  # noqa: BLE001 - 连不上/不是本应用服务都视为不匹配
+        return False
+
+
+def stop_stale_server(port=None):
+    """结束占用端口的【本应用】画廊服务进程（用于旧版本残留服务的自动重启）。
+
+    安全识别方式：通过进程命令行确认是 gallery_server.py 才结束——
+    新旧版本的服务进程命令行相同（都含 gallery_server.py），因此旧版本
+    （没有 /ping 端点）也能被正确识别并结束；其他程序绝不触碰。
+    返回是否成功结束了进程。
+    """
+    port = gallery_server_port(port)
+    if sys.platform != "win32":
+        return False
+    # 1) netstat 找到监听该端口的 PID
+    # 注意：不要用 text=True——中文 Windows 的 netstat 输出是 GBK，而本程序
+    # 可能运行在 UTF-8 模式，直接文本解码会抛 UnicodeDecodeError/得到 None。
+    # 统一拿 bytes 后用 errors="replace" 解码，任何编码都不会崩。
+    try:
+        out_b = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout or b""
+        out = out_b.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        # 列：Proto  Local-Address  Foreign-Address  State  PID
+        if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
+                and parts[1].endswith(":%d" % port):
+            try:
+                pids.add(int(parts[4]))
+            except ValueError:
+                pass
+    killed = False
+    for pid in pids:
+        # 2) 确认该进程命令行确实是本应用的 gallery_server.py（防误杀）
+        if "gallery_server.py" not in _pid_commandline(pid).lower():
+            continue
+        try:
+            r = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            killed = killed or (r.returncode == 0)
+        except Exception:  # noqa: BLE001
+            pass
+    return killed
+
+
+def _pid_commandline(pid):
+    """返回进程命令行文本（查不到返回空串）。用 PowerShell CIM 接口，Win10/11 均可用。
+
+    同样拿 bytes 自行解码（errors="replace"）：中文 Windows 的控制台输出
+    可能是 GBK，text=True 在 UTF-8 模式下会解码失败。
+    """
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine" % pid],
+            capture_output=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return (r.stdout or b"").decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def wait_port_free(port, timeout=5.0):
+    """等待端口释放（结束旧服务进程后，新服务才能绑定成功）。"""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not is_server_up(port):
+            return True
+        time.sleep(0.1)
+    return not is_server_up(port)
 
 
 def main():

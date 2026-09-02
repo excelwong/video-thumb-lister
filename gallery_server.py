@@ -18,8 +18,12 @@
 端点：
   /                              -> 重定向到 /<gallery_name>
   /<gallery_name>.html           -> 画廊页面（同一输出目录内可有多份画廊）
+  /ping                          -> 返回服务代码版本号（纯文本整数，供 GUI 探测
+                                     在线服务是否为旧版本，以便自动重启）
   /thumb?path=<封面图片绝对路径>  -> 封面图片（jpg/jpeg/webp 为目录下已有封面，
                                      png 为无封面时 ffmpeg 抽第 10 秒帧生成的）
+                                     【兼容旧画廊】path 也可以是视频绝对路径，
+                                     服务端会代为解析出封面再返回
   /video?path=<视频绝对路径>      -> 原视频文件（支持 Range，可在弹窗中播放/拖拽）
   /open-explorer?path=<目录绝对路径> -> 调用系统文件浏览器定位到该目录
   /play?path=<视频绝对路径>       -> 调起本机 PotPlayer 播放该视频
@@ -39,6 +43,11 @@ import argparse
 # 优先级：命令行 --port > 环境变量 VTL_GALLERY_PORT > 默认 8765。
 # --------------------------------------------------------------------------
 DEFAULT_PORT = 8765
+
+# 服务代码版本号：/thumb 等端点契约发生变化时 +1。
+# GUI 打开画廊前会用 /ping 探测在线服务的版本，旧版本进程会被自动结束并重启，
+# 避免「代码更新了、常驻服务还在跑旧逻辑」导致缩略图 404 之类的错配。
+SERVER_VERSION = 2
 
 
 def gallery_server_port(explicit=None):
@@ -121,6 +130,36 @@ def _cors(handler):
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+
+# 图片扩展名：/thumb 用它区分「新契约（封面图片路径）」与「旧契约（视频路径）」
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+
+
+def _resolve_cover_for_video(video_path):
+    """【旧画廊兼容】由视频绝对路径解析出封面图片路径；找不到返回 None。
+
+    背景：新版画廊 HTML 里 /thumb 直接传封面图片路径；但用户磁盘上还留有
+    旧版生成的画廊 HTML（里面 /thumb 传的是视频路径）。服务端在这里代为
+    解析封面，让新旧画廊都能正常显示缩略图。
+
+    延迟导入 video_thumb_lister 以复用封面解析逻辑（模块级导入会循环依赖：
+    video_thumb_lister 顶部就 import 本模块）。单独运行 gallery_server.py 时
+    动态加载它也没有副作用。
+    """
+    try:
+        import video_thumb_lister as _vtl  # noqa: PLC0415
+        cover = _vtl._find_cover(video_path)
+        if cover:
+            return cover
+        png = _vtl.frame_png_for_video(video_path)
+        if png and os.path.isfile(png):
+            return png
+    except Exception:  # noqa: BLE001 - 解析失败就走兜底，不让服务崩
+        pass
+    # 最后兜底：更早期版本生成的 <视频名>.thumb.jpg（若用户磁盘上还有）
+    legacy = video_path + ".thumb.jpg"
+    return legacy if os.path.isfile(legacy) else None
 
 
 def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
@@ -215,14 +254,35 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                 self._serve_file(
                     os.path.join(self.server.out_dir, fname),
                     "text/html; charset=utf-8", range_ok=False)
+            elif path == "/ping":
+                # 返回服务代码版本号（纯文本整数），供 GUI 探测在线服务是否旧版本
+                body = str(SERVER_VERSION).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                _cors(self)
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/thumb":
-                # 传入的是【封面图片的绝对路径】（可能是已有封面 jpg/jpeg/webp，
-                # 也可能是抽帧生成的 png），按扩展名返回 MIME 后直接吐文件内容。
+                # 兼容两种请求（新旧画廊 HTML 共存）：
+                #   新画廊：path = 封面图片绝对路径（jpg/jpeg/webp/png）→ 直接发送；
+                #   旧画廊：path = 视频绝对路径（旧版约定"视频路径 + .thumb.jpg"）
+                #           → 服务端代为解析出该视频的封面再发送。
+                # 绝不能把视频文件直接当图片发出去（浏览器 <img> 渲染不了，
+                # 而且大视频会把响应拖死）——这就是「缩略图不见」的根因之一。
                 p = qs.get("path", [""])[0]
-                if p:
-                    self._serve_file(p, self._ct_for(p), range_ok=False)
-                else:
+                if not p:
                     self.send_error(400)
+                    return
+                ext = os.path.splitext(p)[1].lower()
+                if ext in _IMG_EXTS:
+                    self._serve_file(p, self._ct_for(p), range_ok=False)
+                    return
+                cand = _resolve_cover_for_video(p)
+                if cand:
+                    self._serve_file(cand, self._ct_for(cand), range_ok=False)
+                else:
+                    self.send_error(404)
             elif path == "/video":
                 p = qs.get("path", [""])[0]
                 if p:
