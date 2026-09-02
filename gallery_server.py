@@ -39,6 +39,13 @@ import argparse
 # --------------------------------------------------------------------------
 DEFAULT_PORT = 8765
 
+# 1x1 透明 PNG（用于 /ping 健康探测：file:// 页面用 Image() 跨域探测时，
+# 只有真正的图片资源才会触发 onload，文本响应会触发 onerror 造成误报）。
+PING_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6300000002000001e221bc330000000049454e44ae426082"
+)
+
 
 def gallery_server_port(explicit=None):
     """返回服务端口（整数）。explicit 为命令行 --port 覆盖值（可为 None）。"""
@@ -228,6 +235,14 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                 _cors(self)
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/ping":
+                # 健康探测：返回 1x1 PNG（供 file:// 页面用 Image() 跨域探测服务是否在线）。
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(PING_PNG)))
+                _cors(self)
+                self.end_headers()
+                self.wfile.write(PING_PNG)
             elif path == "/play":
                 p = qs.get("path", [""])[0]
                 if not p or not os.path.isfile(p):

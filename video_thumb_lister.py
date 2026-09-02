@@ -903,9 +903,8 @@ body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; ma
 <body>
 <div class="topbar"><h1>视频首帧列表</h1><p>共 ___COUNT___ 个视频 · 生成于 ___GEN___ · 扫描目录：___ROOT___</p></div>
 <div id="modewarn" style="display:none; background:#fff4e5; color:#8a4b00; padding:10px 18px; font-size:13px; line-height:1.6; border-bottom:1px solid #f0c36d;">
-  ⚠️ 你是以「本地文件（file://）」方式打开本画廊的。浏览器出于安全限制，<b>不允许网页在此页面内唤起 PotPlayer</b>，
-  因此 avi / rmvb / flv / ts / vob / wmv / mpg 等格式点击只会打开所在文件夹，无法直接播放。
-  如需「点一下就直接播放任意格式」，请通过本应用界面的 <b>「在浏览器中打开画廊」</b> 按钮打开本页（http 模式，会调用本机播放器）。
+  ⚠️ 本机<b>播放服务未运行</b>：点击缩略图将无法弹出 PotPlayer。请通过本应用界面的
+  <b>「打开画廊」</b>按钮打开（会自动启动本地播放服务），或先扫描一次以启动服务，然后刷新本页。
 </div>
 <div class="layout">
   <nav class="tree">
@@ -969,9 +968,11 @@ document.getElementById('q').addEventListener('input', function(){
 <script>
 // 画廊缩略图用「文件浏览器地址 file://」直接嵌入（双击 html 即可见封面，不依赖服务）。
 // 视频链接 <a href> 也写成 file://（用户可见、可复制），但【左键点击会被 JS 拦截】，
-// 转经本应用本地服务的 /play 端点调起【系统默认视频播放器】（如 PotPlayer）播放——
-// 这正是「昨天」稳稳弹出本机播放器的机制：gallery_server.py 用 os.startfile(视频)，
-// 等价于在资源管理器双击文件，任何格式、任何安装位置都能直接播。服务不可用时退回 file://。
+// 改为用隐藏 iframe 访问本应用本地服务的 /play 端点调起【系统默认视频播放器】
+// （如 PotPlayer）播放。用 iframe 而非 fetch 的关键原因：画廊多以 file:// 双击打开，
+// Chrome 会拦截 file:// 页的 fetch/XHR 跨域请求，却允许 iframe 跨域导航，故 iframe
+// 能从 file:// 页可靠命中服务；服务端 gallery_server.py 用 os.startfile(视频)，
+// 等价于在资源管理器双击文件，任何格式、任何安装位置都能直接播。
 var SERVER_BASE = '___SERVER_BASE___';
 var ctx = document.getElementById('ctx');
 var ctxPath = '', ctxFp = '';
@@ -989,22 +990,27 @@ document.getElementById('grid').addEventListener('contextmenu', function(e){
   showCtx(e, card.dataset.path, card.dataset.fpath);
 });
 
-// 经本地服务 /play 调起本机默认播放器（PotPlayer 等）；服务不可用时退回 file:// 链接。
+// 用隐藏 iframe 访问本应用本地服务：file:// 页面只拦截 fetch/XHR，不拦截 iframe 导航，
+// 故无论画廊以 file://（双击）还是 http://（经服务）打开，点击都能可靠命中 /play
+// （服务端 os.startfile 调起本机默认播放器），不再出现「点了没反应/在浏览器内播放」。
+function hitServer(url){
+  var ifr = document.createElement('iframe');
+  ifr.setAttribute('style',
+    'position:absolute;width:0;height:0;border:0;left:-9999px;top:-9999px;visibility:hidden;');
+  ifr.src = url;
+  document.body.appendChild(ifr);
+  // 2 秒后清理隐藏 iframe（服务端副作用 os.startfile 已同步执行）
+  setTimeout(function(){ if (ifr.parentNode) ifr.parentNode.removeChild(ifr); }, 2000);
+}
+// 经本地服务 /play 调起本机默认播放器（PotPlayer 等）。
 function playVideo(abs){
   if (!abs) return;
-  fetch(SERVER_BASE + '/play?path=' + encodeURIComponent(abs))
-    .then(function(r){ if (!r.ok) throw new Error('bad'); })
-    .catch(function(){
-      // 服务未运行（如关闭 app 后直接双击 html）：退回 file://，由系统默认关联处理。
-      window.open('file:///' + abs.replace(/\\/g, '/'));
-    });
+  hitServer(SERVER_BASE + '/play?path=' + encodeURIComponent(abs));
 }
-// 经本地服务 /open-explorer 打开文件浏览器定位目录；失败退回 file://。
+// 经本地服务 /open-explorer 打开文件浏览器并定位目录。
 function openExplorer(abs){
   if (!abs) return;
-  fetch(SERVER_BASE + '/open-explorer?path=' + encodeURIComponent(abs))
-    .then(function(r){ if (!r.ok) throw new Error('bad'); })
-    .catch(function(){ window.open('file:///' + abs.replace(/\\/g, '/')); });
+  hitServer(SERVER_BASE + '/open-explorer?path=' + encodeURIComponent(abs));
 }
 
 // 左键单击缩略图：拦截默认跳转，改走服务 /play 调起默认播放器（稳，任何格式均可）。
@@ -1050,6 +1056,15 @@ document.addEventListener('DOMContentLoaded', function(){
       a.href = fileUrl(p);
     }
   });
+  // 健康探测：用 Image() 跨域探测本地播放服务是否在线（file:// 页允许加载跨域图片）。
+  // 离线则显示顶部提示条，避免「点击无反应」却不知原因；在线则隐藏（默认隐藏）。
+  var warn = document.getElementById('modewarn');
+  if (warn) {
+    var probe = new Image();
+    probe.onerror = function(){ warn.style.display = 'block'; };
+    probe.onload = function(){ warn.style.display = 'none'; };
+    probe.src = SERVER_BASE + '/ping?t=' + Date.now();
+  }
 });
 </script>
 </body></html>"""
