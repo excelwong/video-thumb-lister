@@ -18,7 +18,8 @@
 端点：
   /                              -> 重定向到 /<gallery_name>
   /<gallery_name>.html           -> 画廊页面（同一输出目录内可有多份画廊）
-  /thumb?path=<视频绝对路径>      -> 该视频的首帧缩略图（.thumb.jpg）
+  /thumb?path=<封面图片绝对路径>  -> 封面图片（jpg/jpeg/webp 为目录下已有封面，
+                                     png 为无封面时 ffmpeg 抽第 10 秒帧生成的）
   /video?path=<视频绝对路径>      -> 原视频文件（支持 Range，可在弹窗中播放/拖拽）
   /open-explorer?path=<目录绝对路径> -> 调用系统文件浏览器定位到该目录
   /play?path=<视频绝对路径>       -> 调起本机 PotPlayer 播放该视频
@@ -136,6 +137,16 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
 
         def _ct_for(self, path):
             ext = os.path.splitext(path)[1].lower()
+            # 图片 MIME：/thumb 端点会拿到 jpg / jpeg / webp（目录下已有封面）
+            # 或 png（无封面时 ffmpeg 抽帧生成），必须按扩展名正确返回，
+            # 否则浏览器无法渲染（webp/png 尤其敏感）。
+            images = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp",
+                ".bmp": "image/bmp", ".gif": "image/gif",
+            }
+            if ext in images:
+                return images[ext]
             return {
                 ".mp4": "video/mp4", ".mkv": "video/x-matroska",
                 ".webm": "video/webm", ".mov": "video/quicktime",
@@ -205,9 +216,11 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                     os.path.join(self.server.out_dir, fname),
                     "text/html; charset=utf-8", range_ok=False)
             elif path == "/thumb":
+                # 传入的是【封面图片的绝对路径】（可能是已有封面 jpg/jpeg/webp，
+                # 也可能是抽帧生成的 png），按扩展名返回 MIME 后直接吐文件内容。
                 p = qs.get("path", [""])[0]
                 if p:
-                    self._serve_file(p + ".thumb.jpg", "image/jpeg", range_ok=False)
+                    self._serve_file(p, self._ct_for(p), range_ok=False)
                 else:
                     self.send_error(400)
             elif path == "/video":

@@ -4,7 +4,7 @@
 video_thumb_lister.py
 ====================================================================
 递归扫描某个目录（含子目录）中的视频文件，
-为每段视频抽取「首帧」缩略图，并生成可浏览的画廊（HTML）。
+为每段视频准备一张封面图，并生成可浏览的画廊（HTML）。
 
 只依赖：
   - Python 3 标准库（无需 opencv / PIL / 第三方包）
@@ -12,23 +12,26 @@ video_thumb_lister.py
 
 用法：
   python video_thumb_lister.py <目录> [--out 输出目录] [--ffmpeg ffmpeg路径] [--force]
-  （不传 <目录> 时，会在交互模式下提示输入；--force 强制重抽全部首帧）
+  （不传 <目录> 时，会在交互模式下提示输入；--force 强制重新抽帧，已有封面图不受影响）
 
 功能（当前实现 (1)+(2)+(3)+(4)）：
-  (1) 扫描目录（含子目录），把每个视频文件的首帧截图 + 文件名列出来
-      —— 以 HTML 画廊形式呈现（每个卡片 = 首帧缩略图 + 文件名 + 路径 + 大小），
+  (1) 扫描目录（含子目录），把每个视频文件的封面图 + 文件名列出来
+      —— 以 HTML 画廊形式呈现（每个卡片 = 封面图 + 文件名 + 路径 + 大小），
          并在控制台打印进度与汇总。
-  (2) 鼠标点击视频首帧截图时，新开一个窗口（弹窗）播放该视频。
+  (2) 鼠标点击视频封面图时，唤起本机播放器（PotPlayer）播放该视频。
   (3) 应用左侧呈现目录树，点击不同子目录可筛选显示对应视频（并附带文件名搜索）。
-  (4) 首次生成的「首帧截图」直接保存在【视频所在的目录】里（文件名形如
-      <视频名>.thumb.jpg）；下次再扫描同一目录时，若发现该截图已存在且来源未被
-      改动（以修改时间判断），则直接复用，不再调用 ffmpeg 重新生成，速度大幅提升。
-      可用 --force 强制重新生成全部缩略图。
-  (4b) 缩略图来源优先级：若视频同目录存在可作封面的图片，则直接把它另存为缩略图，
-      完全跳过抽帧；缓存是否失效也以封面图的修改时间为准（视频改动不再触发重抽，
-      封面被替换才重抽）。封面匹配规则：
-        * 完全同名优先：a.mp4 -> a.jpg / a.png …；
-        * 其次按「核心番号」匹配：剥离视频名末尾的版本后缀（-U/-C/-UC/-CU、末尾 R）
+  (4) 缩略图【不再】为每个视频单独生成文件，来源优先级如下：
+        * 优先：视频同目录已存在的封面图（jpg / jpeg / webp）——【直接引用原图】，
+          不改名、不另存、不转换格式，完全跳过抽帧；
+        * 其次：以前用 ffmpeg 抽帧生成的 <核心番号>.png 还在 -> 直接复用；
+        * 都没有：用 ffmpeg 抽【第 10 秒】的帧，生成 <核心番号>.png 放在视频同目录。
+      核心番号 = 视频名剥离末尾的版本后缀（-U/-C/-UC/-W/-WC…、末尾 R），
+      故同一目录下的 ABC-123.mp4 / ABC-123-C.mp4 / ABC-123R.mp4 共用一张 ABC-123.png，
+      不会重复抽帧。可用 --force 强制重新抽帧（已有的封面图不受影响，仍直接引用）。
+      注：早期版本会生成 <视频名>.thumb.jpg，现已废弃（既有的这类文件不会被自动删除）。
+      封面匹配规则：
+        * 完全同名优先：a.mp4 -> a.jpg / a.jpeg / a.webp …；
+        * 其次按「核心番号」匹配：剥离视频名末尾的版本后缀（-U/-C/-UC/-W/-WC、末尾 R）
           后再找图，故封面 ABC-123.jpg 可用于 ABC-123.mp4 / ABC-123R.mp4 /
           ABC-123-U.mp4 / ABC-123-C.mp4 / ABC-123-UC.mp4。
 ====================================================================
@@ -66,9 +69,12 @@ VIDEO_EXTS = {
     ".ogv", ".mts", ".m2v", ".mp4v", ".f4v", ".rmvb", ".rm",
 }
 
-# 同名封面图候选扩展名（按优先级，先找到的用作缩略图）
-# 例：视频 a.mp4 对应封面 a.jpg / a.png ...
-COVER_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]
+# 「已存在的封面图」候选扩展名（按优先级，先命中的用作缩略图）。
+# 只包含用户自己准备的封面格式：jpg / jpeg / webp。
+# 注意【不含 .png】：.png 是本程序无封面时用 ffmpeg 抽帧生成的产物
+# （见 frame_png_for_video），不能与「用户已有封面」混淆，否则会导致
+# 「有封面 / 需抽帧」的判断被自己的缓存产物干扰。
+COVER_EXTS = [".jpg", ".jpeg", ".webp"]
 
 # ffmpeg 候选路径（按优先级查找）
 FFMPEG_CANDIDATES = [
@@ -657,21 +663,31 @@ def scan_videos(root):
     return found
 
 
-def _thumb_path_for_video(video_path):
-    """缩略图就放在【视频所在目录】，文件名形如 <视频名>.thumb.jpg。
+def frame_png_for_video(video_path):
+    """本程序抽帧生成的封面路径：放在【视频所在目录】，文件名 = <核心番号>.png。
 
-    例：C:/Videos/clip.mp4  ->  C:/Videos/clip.mp4.thumb.jpg
-    这样下次扫描时直接在视频旁边找到它即可复用，无需再次抽帧。
+    核心番号 = 视频名去掉 -C / -U / -UC / -W / -WC 等版本后缀以及末尾 R
+    （见 _cover_core_name）。因此同一目录下的 ABC-123.mp4、ABC-123-C.mp4、
+    ABC-123R.mp4 共用同一张 ABC-123.png，不会重复抽帧。
+
+    例：C:/Videos/ABC-123-C.mp4  ->  C:/Videos/ABC-123.png
+
+    【不再】为每个视频单独生成 <视频全名>.thumb.jpg —— 有现成封面时直接引用
+    原图（不改名、不另存），只有确实没有封面时才生成这一张 png。
     """
-    return video_path + ".thumb.jpg"
+    d = os.path.dirname(video_path)
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(d, _cover_core_name(base) + ".png")
 
 
 # 视频名相对「核心番号」可能带的版本后缀（不区分大小写）：
-#   -U / -C / -UC / -CU （去码 / 中文字幕 等标记，带连字符）
+#   -U / -C / -UC / -W / -WC / -CW（去码 / 中文字幕 等标记，带连字符）
 #   末尾单独的 R          （流出/修正版等标记，直接附着，无连字符）
+# 用字符类 [UCW]{1,3} 一次覆盖所有 U/C/W 的 1~3 位组合，
 # 例：核心番号 ABC-123 的封面 ABC-123.jpg，可用于
-#   ABC-123.mp4 / ABC-123R.mp4 / ABC-123-U.mp4 / ABC-123-C.mp4 / ABC-123-UC.mp4
-_COVER_TAIL_TAG = re.compile(r"-(?:U|C|UC|CU)$", re.IGNORECASE)
+#   ABC-123.mp4 / ABC-123R.mp4 / ABC-123-U.mp4 / ABC-123-C.mp4
+#   / ABC-123-UC.mp4 / ABC-123-W.mp4 / ABC-123-WC.mp4
+_COVER_TAIL_TAG = re.compile(r"-(?:[UCW]{1,3})$", re.IGNORECASE)
 _COVER_TAIL_R = re.compile(r"R$", re.IGNORECASE)
 
 
@@ -700,6 +716,15 @@ def _cover_core_candidates(base):
     return out
 
 
+def _cover_core_name(base):
+    """视频名（不含扩展名）-> 核心番号。
+
+    取 _cover_core_candidates 的【最后一个】候选，即剥离得最干净的核心名。
+    用于给抽帧生成的封面 png 命名，使同一个番号的不同版本共用一张封面。
+    """
+    return _cover_core_candidates(base)[-1]
+
+
 def _find_cover(video_path):
     """在视频同目录找可作封面的同名/核心名图片。
 
@@ -720,31 +745,58 @@ def _find_cover(video_path):
     return None
 
 
-def _need_regen(video_path, thumb_file):
-    """判断缩略图是否需要重新生成。
+def resolve_thumbnail(video_path, ffmpeg, force=False, timeout=120):
+    """确定一个视频该用哪张图当封面，返回 (图片绝对路径 或 None, 来源标记)。
 
-    缩略图来源优先级：同目录同名封面图 > ffmpeg 抽帧。
-    因此缓存是否失效，以「实际来源」为准：
-      - 缩略图不存在                    -> 需要
-      - 存在同名封面图：以封面 mtime 为准（封面被替换 -> 需要）
-      - 否则以视频 mtime 为准（视频被替换/编辑 -> 需要）
-    force 由调用方在传入前处理。
+    优先级：
+      1) 同目录已存在的封面（jpg / jpeg / webp，按核心番号匹配）
+         -> 【直接引用原图】，不改名、不另存、不转换格式；
+      2) 以前抽帧生成的 <核心番号>.png 还在
+         -> 直接复用，不重复抽帧；
+      3) 都没有 -> 用 ffmpeg 抽【第 10 秒】的帧，生成 <核心番号>.png。
+
+    来源标记 action：
+      "cover"        命中已有封面（第 1 种）；
+      "frame-cached" 复用了已有的抽帧 png（第 2 种）；
+      "frame-new"    本次刚抽帧生成（第 3 种）；
+      "none"         失败（无封面且抽帧失败），返回路径为 None。
     """
-    if not os.path.isfile(thumb_file):
-        return True
+    cover = _find_cover(video_path)
+    if cover:
+        return cover, "cover"
+
+    png = frame_png_for_video(video_path)
+    if (not force) and os.path.isfile(png):
+        try:
+            if os.path.getsize(png) > 0:
+                return png, "frame-cached"
+        except OSError:
+            pass
+
     try:
-        t_thumb = os.path.getmtime(thumb_file)
-    except OSError:
-        return True
-    # 缩略图存在但本身不是真正的 JPEG（例如旧版本把 webp 改名当 jpg 留下的伪文件），
-    # 重新生成以确保输出是合法的 jpg。
-    if not _is_jpeg_file(thumb_file):
-        return True
-    ref = _find_cover(video_path) or video_path
-    try:
-        return t_thumb < os.path.getmtime(ref)
-    except OSError:
-        return True
+        extract_cover_frame(ffmpeg, video_path, png, timeout=timeout)
+        return png, "frame-new"
+    except Exception:  # noqa: BLE001 - 单个视频失败不应中断整体扫描
+        return None, "none"
+
+
+def build_thumb_map(videos, ffmpeg, force=False, timeout=120, on_item=None):
+    """批量解析封面，返回 {视频绝对路径: 封面图片绝对路径}（失败的项不在字典里）。
+
+    on_item(video, thumb, action) 为可选回调，供 GUI / CLI 打日志与更新进度；
+    回调内抛出的异常会被吞掉，避免日志问题影响扫描。
+    """
+    result = {}
+    for v in videos:
+        thumb, action = resolve_thumbnail(v, ffmpeg, force=force, timeout=timeout)
+        if thumb:
+            result[v] = thumb
+        if on_item:
+            try:
+                on_item(v, thumb, action)
+            except Exception:  # noqa: BLE001
+                pass
+    return result
 
 
 def _is_jpeg_file(path):
@@ -791,21 +843,26 @@ def _convert_image_to_jpg(src, dst, ffmpeg):
     return True
 
 
-def extract_first_frame(ffmpeg, video_path, out_jpg, timeout=120):
-    """用 ffmpeg 抽取「第 3 秒附近」的那一帧作为缩略图。
+def extract_cover_frame(ffmpeg, video_path, out_png, timeout=120):
+    """用 ffmpeg 抽取视频【第 10 秒】的那一帧，生成封面 png（宽度缩放为 320）。
 
-    很多视频片头是黑场/淡入/标题卡，抽第 0 秒或第 1 秒的帧仍可能黑屏，
-    所以这里默认取约 3 秒处的画面。
+    取第 10 秒而不是首帧：片头常是黑场 / 淡入 / 标题卡，第 10 秒通常是正片画面，
+    作为封面更有辨识度。若视频不足 10 秒，则回退到真正的首帧（-ss 0）。
 
-    把 -ss 放在 -i 之后（输出定位），可保证取到真正约 3 秒处的帧，
-    不会被关键帧对齐带回到 0 秒；缩放为宽度 320。
-    若视频不足 3 秒导致取帧失败，则回退到真正的首帧（-ss 0）。
+    两个关键细节（都是踩过的坑）：
+      - 必须加 -update 1：新版 ffmpeg 的单帧图像输出器默认不写出文件，
+        少了它在部分版本上会「返回码 0 但文件根本没生成」，且无任何报错；
+      - 抽帧后校验产物存在且非空，否则视为失败并触发回退，
+        避免把「没出图」误判成「抽帧成功」。
+
+    -ss 放在 -i 之后（输出定位），保证真正取到第 10 秒的帧，
+    不会被关键帧对齐带回 0 秒。
     """
     def _run(ss):
         cmd = [
             ffmpeg, "-y", "-i", video_path,
             "-ss", ss, "-frames:v", "1", "-an",
-            "-vf", "scale=320:-1", "-q:v", "3", out_jpg,
+            "-vf", "scale=320:-1", "-update", "1", out_png,
         ]
         run_kwargs = dict(
             stdout=subprocess.DEVNULL,
@@ -819,12 +876,16 @@ def extract_first_frame(ffmpeg, video_path, out_jpg, timeout=120):
         if sys.platform == "win32":
             run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.run(cmd, **run_kwargs)
+        # 产物校验：没有输出文件就当失败，交给下面的回退/异常流程处理
+        if not (os.path.isfile(out_png) and os.path.getsize(out_png) > 0):
+            raise subprocess.CalledProcessError(
+                1, cmd, b"ffmpeg exited 0 but produced no output frame")
 
     try:
-        _run("3")
+        _run("10")
         return
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        # 第一次可能因视频不足 3 秒而失败，回退到真正首帧再试一次
+        # 第一次可能因视频不足 10 秒而失败，回退到真正首帧再试一次
         pass
     try:
         _run("0")
@@ -842,7 +903,7 @@ def extract_first_frame(ffmpeg, video_path, out_jpg, timeout=120):
 HTML_TEMPLATE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>视频首帧列表（___COUNT___）</title>
+<title>视频封面画廊（___COUNT___）</title>
 <style>
 * { box-sizing: border-box; }
 body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; height: 100vh; display: flex; flex-direction: column; }
@@ -885,7 +946,7 @@ body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; ma
 .ctx-item:hover { background: #eef2f7; }
 </style></head>
 <body>
-<div class="topbar"><h1>视频首帧列表</h1><p>共 ___COUNT___ 个视频 · 生成于 ___GEN___ · 扫描目录：___ROOT___</p></div>
+<div class="topbar"><h1>视频封面画廊</h1><p>共 ___COUNT___ 个视频 · 生成于 ___GEN___ · 扫描目录：___ROOT___</p></div>
 <div id="modewarn" style="display:none; background:#fff4e5; color:#8a4b00; padding:10px 18px; font-size:13px; line-height:1.6; border-bottom:1px solid #f0c36d;">
   ⚠️ 你是以「本地文件（file://）」方式打开本画廊的。浏览器出于安全限制，<b>不允许网页在此页面内唤起 PotPlayer</b>，
   因此 avi / rmvb / flv / ts / vob / wmv / mpg 等格式点击只会打开所在文件夹，无法直接播放。
@@ -1047,8 +1108,13 @@ document.addEventListener('DOMContentLoaded', function(){
     var img = card.querySelector('img');
     var a = card.querySelector('a.thumb-link');
     if (img) {
-      img.src = makeThumbUrl(p, fp);
-      img.onerror = function(){ this.onerror = null; this.src = 'file:///' + fp + '.thumb.jpg'; };
+      // 封面：用解析好的封面图片路径（data-thumb）——可能是目录下已有的封面原图
+      // （jpg / jpeg / webp，直接引用、不改名不另存），也可能是抽帧生成的
+      // <核心番号>.png。经本地服务 /thumb 返回，服务端按扩展名给出正确 MIME。
+      var th = card.dataset.thumb || p;
+      img.src = makeThumbUrl(th, fp);
+      // 取不到封面就隐藏图片（不再回退到任何已废弃的旧缩略图文件）
+      img.onerror = function(){ this.onerror = null; this.style.display = 'none'; };
     }
     if (a) a.href = makeVurl(p, fp);
   });
@@ -1115,20 +1181,16 @@ def build_tree(videos, root):
     )
 
 
-def build_gallery(videos, out_html, root, serve=False):
+def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
     """生成 HTML 画廊（左侧目录树 + 右侧缩略图网格）。
 
-    缩略图位于各视频所在目录（见 _thumb_path_for_video）。
+    thumb_map 为 {视频绝对路径: 封面图片绝对路径}（由 build_thumb_map 产出）。
+    封面由调用方解析好：优先直接引用目录下已有的封面原图（jpg/jpeg/webp，
+    不改名不另存），没有才用 ffmpeg 抽第 10 秒帧生成的 <核心番号>.png。
+    没传 thumb_map 时，退化为「现找封面，找不到就指向抽帧 png 的路径」。
 
-    关键：画廊本身【不再区分 serve / file:// 两种生成方式】。
-    卡片只写入视频的绝对路径（data-path / data-fpath），URL 在浏览器端
-    按打开方式自动决定：
-      - 经本应用本地服务打开（http://）→ 走 /thumb、/video、/open-explorer；
-      - 直接双击打开（file://）→ 走本地 file:// 绝对路径。
-    因此同一份 HTML 既能由本应用服务访问，也能单独双击打开，
-    缩略图与单击播放在两种场景下都正常。
-    serve 参数仅保留用于向后兼容（GUI 仍据此决定是否启动本地服务），
-    不再影响写入的 URL 形式。
+    ⚠️ 本函数【只负责封面显示】。视频的播放链接（/video）与单击行为
+    （JS openPlayer -> /play 唤起本机播放器）在此【不做任何改动】。
     """
     root_abs = os.path.abspath(root)
 
@@ -1141,12 +1203,17 @@ def build_gallery(videos, out_html, root, serve=False):
     rows = []
     for v in videos:
         name = os.path.basename(v)
-        thumb_file = _thumb_path_for_video(v)
+        # 封面：优先用已解析好的；没传 map 时现找（已有封面 -> 抽帧 png）
+        thumb_file = (thumb_map or {}).get(v)
+        if not thumb_file:
+            thumb_file = _find_cover(v) or frame_png_for_video(v)
         if serve:
             # 绝对服务器地址：无论画廊以 http:// 还是 file:// 打开，缩略图/视频
             # 都命中独立的 gallery_server.py（端口与生成时一致，默认 8765）。
             base = gallery_server_base()
-            thumb_url = base + "/thumb?path=" + urllib.parse.quote(v)
+            # /thumb 传【封面图片的绝对路径】，服务端按扩展名返回正确 MIME
+            # （jpg / jpeg / webp / png 都能正常显示）。
+            thumb_url = base + "/thumb?path=" + urllib.parse.quote(thumb_file)
             vurl = base + "/video?path=" + urllib.parse.quote(v)
         else:
             thumb_url = file_url(thumb_file)
@@ -1160,6 +1227,7 @@ def build_gallery(videos, out_html, root, serve=False):
             '<div class="card" data-dir="' + html.escape(d, quote=True) + '" '
             'data-name="' + html.escape(name, quote=True) + '" '
             'data-path="' + html.escape(v, quote=True) + '" '
+            'data-thumb="' + html.escape(thumb_file, quote=True) + '" '
             'data-fpath="' + html.escape(v.replace("\\", "/"), quote=True) + '">'
             f'<a class="thumb-link" href="{html.escape(vurl, quote=True)}" '
             f'rel="noopener" title="点击播放：{html.escape(name)}">'
@@ -1231,7 +1299,8 @@ def _safe_cover_name(video_path):
     return h + ".jpg"
 
 
-def build_chm_gallery(videos, work_dir, root, charset="utf-8", body_encoding="utf-8"):
+def build_chm_gallery(videos, work_dir, root, charset="utf-8",
+                      body_encoding="utf-8", thumb_map=None):
     """生成 CHM 专用画廊：把封面拷进 work_dir/covers/，返回 (画廊HTML路径, 目录索引表)。
 
     每张卡片只展示封面图 + 文件名/路径（不再内置任何外部播放器调用）。
@@ -1267,7 +1336,10 @@ def build_chm_gallery(videos, work_dir, root, charset="utf-8", body_encoding="ut
         rows = []
         for v in groups[d]:
             name = os.path.basename(v)
-            thumb_src = _thumb_path_for_video(v)
+            # 封面：优先用解析好的；没传 map 时现找（已有封面 -> 抽帧 png）
+            thumb_src = (thumb_map or {}).get(v)
+            if not thumb_src:
+                thumb_src = _find_cover(v) or frame_png_for_video(v)
             cover_name = _safe_cover_name(v)
             cover_dst = os.path.join(covers_dir, cover_name)
             if os.path.isfile(thumb_src):
@@ -1417,7 +1489,7 @@ def _get_ansi_codepage():
         return 936
 
 
-def build_chm(videos, out_dir, root):
+def build_chm(videos, out_dir, root, thumb_map=None):
     """把画廊编译成 .chm，返回 .chm 绝对路径。
 
     编译器：优先 hhc.exe（微软官方，能编译出真正的左侧目录树/导航栏）；
@@ -1472,7 +1544,8 @@ def build_chm(videos, out_dir, root):
     work_dir = tempfile.mkdtemp(prefix="chm_build_")
 
     gallery_html, folder_index = build_chm_gallery(
-        videos, work_dir, root, charset=body_charset, body_encoding=body_encoding
+        videos, work_dir, root, charset=body_charset,
+        body_encoding=body_encoding, thumb_map=thumb_map
     )
 
     # 收集封面文件（相对工作目录，反斜杠，编译器识别）
@@ -1627,13 +1700,13 @@ def launch_server_subprocess(out_dir, gallery_name, port_file):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="递归扫描视频并列出首帧截图与文件名")
+    ap = argparse.ArgumentParser(description="递归扫描视频并列出封面图与文件名")
     ap.add_argument("directory", nargs="?", help="要扫描的目录（含子目录）")
     ap.add_argument("--out", default=None,
                    help="画廊 HTML 输出目录（默认在当前目录建 video_thumb_output）")
     ap.add_argument("--ffmpeg", default=None, help="ffmpeg 可执行文件路径（找不到时自动搜索）")
     ap.add_argument("--force", action="store_true",
-                   help="强制重新生成所有首帧截图（忽略已存在的缓存）")
+                   help="强制重新抽帧（忽略已生成的 png 缓存；目录里已有的封面图仍直接引用）")
     ap.add_argument("--chm", action="store_true",
                    help="扫描完成后额外把画廊打包成 .chm（需本机安装 HTML Help Workshop 的 hhc.exe）")
     ap.add_argument("--serve", action="store_true",
@@ -1686,45 +1759,40 @@ def main():
 
     print(f"正在扫描：{directory}")
     videos = scan_videos(directory)
-    print(f"找到 {len(videos)} 个视频文件。开始抽取首帧（约第 3 秒处）...")
+    print("找到 %d 个视频文件。解析封面（优先用目录已有封面，无封面才抽第 10 秒帧）..."
+          % len(videos))
 
     ok, cached, cover_used, fail = 0, 0, 0, 0
-    for i, v in enumerate(videos, 1):
+    state = {"i": 0}
+
+    def _on_item(v, thumb, action):
+        nonlocal ok, cached, cover_used, fail
+        state["i"] += 1
+        i, total = state["i"], len(videos)
         name = os.path.basename(v)
-        out_jpg = _thumb_path_for_video(v)
-        # 缓存命中：已存在且来源（封面或视频）未被改动（--force 时跳过此分支）
-        if not args.force and not _need_regen(v, out_jpg):
+        if action == "cover":
+            cover_used += 1
+            print(f"  (封面) ({i}/{total}) {name}  <-  {os.path.basename(thumb)}", flush=True)
+        elif action == "frame-cached":
             cached += 1
-            print(f"  (缓存) ({i}/{len(videos)}) {name}", flush=True)
-            continue
-        # 优先使用同名封面图：直接另存为缩略图，跳过抽帧
-        cover = _find_cover(v)
-        if cover is not None:
-            try:
-                _convert_image_to_jpg(cover, out_jpg, ffmpeg)
-                cover_used += 1
-                print(f"  (封面) ({i}/{len(videos)}) {name}  <-  {os.path.basename(cover)}", flush=True)
-            except Exception as e:  # noqa: BLE001
-                fail += 1
-                print(f"  [跳过] {name}：{e}", file=sys.stderr)
-                record_failure(out_dir, v, str(e), err_log)
-            continue
-        try:
-            extract_first_frame(ffmpeg, v, out_jpg)
+            print(f"  (缓存) ({i}/{total}) {name}", flush=True)
+        elif action == "frame-new":
             ok += 1
-        except Exception as e:  # noqa: BLE001 - 单个文件失败不应中断整体
+            print(f"  (抽帧) ({i}/{total}) {name}  ->  {os.path.basename(thumb)}", flush=True)
+        else:
             fail += 1
-            print(f"  [跳过] {name}：{e}", file=sys.stderr)
-            record_failure(out_dir, v, str(e), err_log)
-        print(f"  ({i}/{len(videos)}) {name}", flush=True)
+            print(f"  [跳过] {name}：无封面且 ffmpeg 抽帧失败", file=sys.stderr)
+            record_failure(out_dir, v, "无封面且 ffmpeg 抽帧失败", err_log)
+
+    thumb_map = build_thumb_map(videos, ffmpeg, force=args.force, on_item=_on_item)
 
     out_html = os.path.join(out_dir, gallery_filename_for(directory))
-    build_gallery(videos, out_html, directory)
+    build_gallery(videos, out_html, directory, thumb_map=thumb_map)
     save_scan_log_entry(out_dir, directory, os.path.basename(out_html), len(videos))
 
     if args.chm:
         try:
-            chm_path = build_chm(videos, out_dir, directory)
+            chm_path = build_chm(videos, out_dir, directory, thumb_map=thumb_map)
             print(f"CHM 已生成：{chm_path}")
         except Exception as e:  # noqa: BLE001 - CHM 失败不应影响画廊本身
             print(f"CHM 打包失败：{e}", file=sys.stderr)

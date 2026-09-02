@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-video_thumb_lister_gui.py —— 视频首帧列表（带 GUI 的版本）
+video_thumb_lister_gui.py —— 视频封面画廊（带 GUI 的版本）
 ====================================================================
 启动后只显示界面，不自动扫描：用户先点「浏览…」选目录，再点「开始扫描」才执行；
 （若在命令行显式传入目录，则按原行为直接扫描。）
 
   - 递归扫描该目录（含子目录）下的所有视频文件；
-  - 为每个视频准备首帧缩略图：
-        * 同目录有同名封面图（a.jpg / a.png …）→ 直接另存为缩略图，跳过抽帧；
-        * 否则用 ffmpeg 抽首帧；
-        * 缩略图已存在且来源未被改动 → 直接复用，不调 ffmpeg（功能 (4)）。
+  - 为每个视频准备封面图（优先级从高到低）：
+        * 同目录已有封面图（a.jpg / a.jpeg / a.webp，按核心番号匹配）
+          → 直接引用原图，不改名、不另存、跳过抽帧；
+        * 以前抽帧生成的 <核心番号>.png 还在 → 直接复用；
+        * 都没有 → 用 ffmpeg 抽【第 10 秒】的帧，生成 <核心番号>.png；
   - 生成 HTML 画廊（左侧目录树 + 右侧缩略图网格，点击缩略图新窗口播放）；
   - 扫描完成后自动用默认浏览器打开画廊。
 
@@ -43,7 +44,7 @@ from video_thumb_lister import reveal_in_explorer
 class ThumbListerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("视频首帧列表生成器")
+        self.title("视频封面画廊生成器")
         self.geometry("780x580")
 
         self._dir = tk.StringVar(value="")
@@ -182,37 +183,35 @@ class ThumbListerApp(tk.Tk):
 
         ok = cover = cached = fail = 0
         total = len(videos)
-        for i, v in enumerate(videos, 1):
+        state = {"i": 0}
+
+        def on_item(v, thumb, action):
+            nonlocal ok, cover, cached, fail
+            state["i"] += 1
+            i = state["i"]
             name = os.path.basename(v)
             self.q.put(("status", f"正在处理 {i}/{total}：{name}"))
-            out_jpg = vtl._thumb_path_for_video(v)
-            if (not force) and (not vtl._need_regen(v, out_jpg)):
+            if action == "cover":
+                # 目录下已有封面：直接引用原图，不改名、不另存
+                cover += 1
+                self.q.put(("log", f"  (封面) ({i}/{total}) {name}  <-  {os.path.basename(thumb)}"))
+            elif action == "frame-cached":
                 cached += 1
                 self.q.put(("log", f"  (缓存) ({i}/{total}) {name}"))
+            elif action == "frame-new":
+                # 无封面：ffmpeg 抽第 10 秒帧，生成 <核心番号>.png
+                ok += 1
+                self.q.put(("log", f"  (抽帧) ({i}/{total}) {name}  ->  {os.path.basename(thumb)}"))
             else:
-                cover_img = vtl._find_cover(v)
-                if cover_img is not None:
-                    try:
-                        shutil.copy2(cover_img, out_jpg)
-                        cover += 1
-                        self.q.put(("log", f"  (封面) ({i}/{total}) {name}  <-  {os.path.basename(cover_img)}"))
-                    except Exception as e:  # noqa: BLE001
-                        fail += 1
-                        self.q.put(("log", f"  [跳过] {name}：{e}"))
-                        vtl.record_failure(out_dir, v, str(e), err_log)
-                else:
-                    try:
-                        vtl.extract_first_frame(ffmpeg, v, out_jpg)
-                        ok += 1
-                        self.q.put(("log", f"  ({i}/{total}) {name}"))
-                    except Exception as e:  # noqa: BLE001
-                        fail += 1
-                        self.q.put(("log", f"  [跳过] {name}：{e}"))
-                        vtl.record_failure(out_dir, v, str(e), err_log)
+                fail += 1
+                self.q.put(("log", f"  [跳过] {name}：无封面且 ffmpeg 抽帧失败"))
+                vtl.record_failure(out_dir, v, "无封面且 ffmpeg 抽帧失败", err_log)
             self.q.put(("progress", (i, total)))
 
+        thumb_map = vtl.build_thumb_map(videos, ffmpeg, force=force, on_item=on_item)
+
         out_html = os.path.join(out_dir, vtl.gallery_filename_for(directory))
-        vtl.build_gallery(videos, out_html, directory, serve=True)
+        vtl.build_gallery(videos, out_html, directory, serve=True, thumb_map=thumb_map)
         vtl.save_scan_log_entry(out_dir, directory, os.path.basename(out_html), total)
         if fail:
             self.q.put(("log", f"失败明细已写入：{err_log}"))
