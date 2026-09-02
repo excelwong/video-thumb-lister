@@ -843,13 +843,20 @@ def extract_cover_frame(ffmpeg, video_path, out_png, timeout=120):
     很多视频片头是黑场/淡入/标题卡，抽首帧或前几秒仍可能黑屏，
     故默认取约 10 秒处的画面。-ss 放在 -i 之后（输出定位）保证取到真正约 10 秒处帧，
     不会被关键帧对齐带回到 0 秒；缩放为宽度 320（与画廊缩略图一致），png 无损保存。
-    若视频不足 10 秒导致取帧失败，则回退到真正的首帧（-ss 0）。
+    若视频不足 10 秒（或第 10 秒处无有效帧）导致取帧失败，则回退到真正的首帧（-ss 0）。
+
+    关键坑（修复）：
+      - 新版 ffmpeg 输出单张 png 必须加 `-update 1`，否则会报
+        "does not contain an image sequence pattern" 且【不写文件】（rc 仍为 0）；
+      - 视频短于 10 秒时 `-ss 10` 可能 rc=0 但不产出任何帧（文件未生成/为空），
+        因此不能只靠「异常」来判断失败，必须校验【输出文件确实存在且非空】，
+        否则封面路径被记进画廊却指向一个不存在的文件，浏览器里看不到封面。
     """
     def _run(ss):
         cmd = [
-            ffmpeg, "-y", "-i", video_path,
-            "-ss", ss, "-frames:v", "1", "-an",
-            "-vf", "scale=320:-1", out_png,
+            ffmpeg, "-y", "-ss", ss, "-i", video_path,
+            "-frames:v", "1", "-an",
+            "-vf", "scale=320:-1", "-update", "1", out_png,
         ]
         run_kwargs = dict(
             stdout=subprocess.DEVNULL,
@@ -864,12 +871,20 @@ def extract_cover_frame(ffmpeg, video_path, out_png, timeout=120):
             run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.run(cmd, **run_kwargs)
 
+    def _produced():
+        # 校验 ffmpeg 真的写出来了（存在且非空），避免 rc=0 但文件缺失的假成功
+        try:
+            return os.path.getsize(out_png) > 0
+        except OSError:
+            return False
+
+    # 先抽第 10 秒；无论 ffmpeg 是否报错，只要没产出有效文件就回退首帧
     try:
         _run("10")
-        return
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        # 第一次可能因视频不足 10 秒而失败，回退到真正首帧再试一次
         pass
+    if _produced():
+        return
     try:
         _run("0")
     except subprocess.TimeoutExpired as e:
@@ -881,6 +896,9 @@ def extract_cover_frame(ffmpeg, video_path, out_png, timeout=120):
         raise ThumbExtractError(
             video_path, e.returncode, _ffmpeg_stderr_tail(e.stderr)
         ) from e
+    if not _produced():
+        # 两次都 rc=0 但都没写出有效 png（极少见，如源损坏）
+        raise ThumbExtractError(video_path, None, "ffmpeg 未生成有效的封面 PNG 文件")
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -1085,7 +1103,12 @@ function makeThumbUrl(thumb){ return SERVER_BASE + '/thumb?path=' + encodeURICom
 function makeVurl(p, fp){ return SERVER_BASE + '/video?path=' + encodeURIComponent(p); }
 
 // 初始化：根据打开方式（本地 file:// 双击 / 经本应用服务 http://）补全每张卡片的缩略图与播放链接
+// 关键：同一份 HTML 既能由本应用服务访问，也能直接双击打开。
+//   - file:// 模式（直接双击）：封面/视频都用本地 file:// 绝对路径，不依赖任何服务器；
+//   - http:// 模式（经 gallery_server）：封面走 /thumb、视频走 /video，并保留 file:// 兜底。
 document.addEventListener('DOMContentLoaded', function(){
+  var served = (location.protocol === 'http:' || location.protocol === 'https:');
+  function fileUrl(abs){ return 'file:///' + encodeURI((abs || '').replace(/\\/g, '/')); }
   document.querySelectorAll('.card').forEach(function(card){
     var p = card.dataset.path, fp = card.dataset.fpath;
     var img = card.querySelector('img');
@@ -1093,13 +1116,23 @@ document.addEventListener('DOMContentLoaded', function(){
     if (img) {
       var thumb = card.dataset.thumb || '';
       if (thumb) {
-        img.src = makeThumbUrl(thumb);
-        img.onerror = function(){ this.onerror = null; this.src = 'file:///' + thumb.replace(/\\/g, '/'); };
+        if (served) {
+          img.src = makeThumbUrl(thumb);
+          // 服务器不可用时（如服务已关闭）兜底用本地文件，保证仍能看到封面
+          img.onerror = function(){ this.onerror = null; this.src = fileUrl(thumb); };
+        } else {
+          // 直接双击打开：封面就是同目录图片，直接用 file:// 绝对路径，无需服务器
+          img.src = fileUrl(thumb);
+          // 极端情况下（如网络盘脱机）再尝试走服务器兜底
+          img.onerror = function(){ this.onerror = null; this.src = makeThumbUrl(thumb); };
+        }
       } else {
         img.style.display = 'none';
       }
     }
-    if (a) a.href = makeVurl(p, fp);
+    if (a) {
+      a.href = served ? makeVurl(p, fp) : fileUrl(fp);
+    }
   });
 });
 </script>
