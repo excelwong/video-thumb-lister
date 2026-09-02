@@ -18,7 +18,7 @@
 端点：
   /                              -> 重定向到 /<gallery_name>
   /<gallery_name>.html           -> 画廊页面（同一输出目录内可有多份画廊）
-  /thumb?path=<视频绝对路径>      -> 该视频的首帧缩略图（.thumb.jpg）
+  /thumb?path=<缩略图绝对路径>   -> 该视频的封面缩略图文件（jpg/webp/png，按扩展名返回正确 MIME）
   /video?path=<视频绝对路径>      -> 原视频文件（支持 Range，可在弹窗中播放/拖拽）
   /open-explorer?path=<目录绝对路径> -> 调用系统文件浏览器定位到该目录
   /play?path=<视频绝对路径>       -> 调起本机 PotPlayer 播放该视频
@@ -143,6 +143,15 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                 ".ts": "video/mp4", ".ogv": "video/ogg",
             }.get(ext, "application/octet-stream")
 
+        def _ct_for_image(self, path):
+            """按扩展名返回图片 MIME（封面缩略图可能是 jpg/webp/png）。"""
+            ext = os.path.splitext(path)[1].lower()
+            return {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp",
+                ".gif": "image/gif", ".bmp": "image/bmp",
+            }.get(ext, "application/octet-stream")
+
         def _serve_file(self, fpath, ctype, range_ok=True):
             if not os.path.isfile(fpath):
                 self.send_error(404)
@@ -207,7 +216,7 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
             elif path == "/thumb":
                 p = qs.get("path", [""])[0]
                 if p:
-                    self._serve_file(p + ".thumb.jpg", "image/jpeg", range_ok=False)
+                    self._serve_file(p, self._ct_for_image(p), range_ok=False)
                 else:
                     self.send_error(400)
             elif path == "/video":

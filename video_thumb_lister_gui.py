@@ -175,44 +175,47 @@ class ThumbListerApp(tk.Tk):
         self.q.put(("log", f"找到 {len(videos)} 个视频文件。"))
         if not videos:
             out_html = os.path.join(out_dir, vtl.gallery_filename_for(directory))
-            vtl.build_gallery(videos, out_html, directory, serve=True)
+            vtl.build_gallery(videos, out_html, directory, serve=True, thumb_map={})
             vtl.save_scan_log_entry(out_dir, directory, os.path.basename(out_html), 0)
             self.q.put(("done", (0, 0, 0, 0, out_html, 0)))
             return
 
         ok = cover = cached = fail = 0
         total = len(videos)
+        thumb_map = {}
         for i, v in enumerate(videos, 1):
             name = os.path.basename(v)
             self.q.put(("status", f"正在处理 {i}/{total}：{name}"))
-            out_jpg = vtl._thumb_path_for_video(v)
-            if (not force) and (not vtl._need_regen(v, out_jpg)):
+            thumb, action = None, "none"
+            exc = None
+            try:
+                thumb, action = vtl.resolve_thumbnail(v, ffmpeg, force=force)
+            except Exception as e:  # noqa: BLE001
+                exc = e
+                action = "none"
+            if thumb:
+                thumb_map[v] = thumb
+            if action == "cover":
+                cover += 1
+                self.q.put(("log", f"  (封面) ({i}/{total}) {name}  <-  {os.path.basename(thumb)}"))
+            elif action == "frame-cached":
                 cached += 1
-                self.q.put(("log", f"  (缓存) ({i}/{total}) {name}"))
-            else:
-                cover_img = vtl._find_cover(v)
-                if cover_img is not None:
-                    try:
-                        shutil.copy2(cover_img, out_jpg)
-                        cover += 1
-                        self.q.put(("log", f"  (封面) ({i}/{total}) {name}  <-  {os.path.basename(cover_img)}"))
-                    except Exception as e:  # noqa: BLE001
-                        fail += 1
-                        self.q.put(("log", f"  [跳过] {name}：{e}"))
-                        vtl.record_failure(out_dir, v, str(e), err_log)
+                self.q.put(("log", f"  (缓存) ({i}/{total}) {name}  <-  {os.path.basename(thumb)}"))
+            elif action == "frame-new":
+                ok += 1
+                self.q.put(("log", f"  ({i}/{total}) {name}  ->  {os.path.basename(thumb)}"))
+            else:  # none（含异常）
+                fail += 1
+                if exc:
+                    self.q.put(("log", f"  [跳过] {name}：{exc}"))
+                    vtl.record_failure(out_dir, v, str(exc), err_log)
                 else:
-                    try:
-                        vtl.extract_first_frame(ffmpeg, v, out_jpg)
-                        ok += 1
-                        self.q.put(("log", f"  ({i}/{total}) {name}"))
-                    except Exception as e:  # noqa: BLE001
-                        fail += 1
-                        self.q.put(("log", f"  [跳过] {name}：{e}"))
-                        vtl.record_failure(out_dir, v, str(e), err_log)
+                    self.q.put(("log", f"  [跳过] {name}：无法生成封面"))
+                    vtl.record_failure(out_dir, v, "无可用封面", err_log)
             self.q.put(("progress", (i, total)))
 
         out_html = os.path.join(out_dir, vtl.gallery_filename_for(directory))
-        vtl.build_gallery(videos, out_html, directory, serve=True)
+        vtl.build_gallery(videos, out_html, directory, serve=True, thumb_map=thumb_map)
         vtl.save_scan_log_entry(out_dir, directory, os.path.basename(out_html), total)
         if fail:
             self.q.put(("log", f"失败明细已写入：{err_log}"))
@@ -382,7 +385,7 @@ class ThumbListerApp(tk.Tk):
     def _chm_worker(self, directory):
         try:
             videos = vtl.scan_videos(directory)
-            self.q.put(("log", f"找到 {len(videos)} 个视频，准备生成 CHM（封面取自已抽好的 .thumb.jpg）…"))
+            self.q.put(("log", f"找到 {len(videos)} 个视频，准备生成 CHM（封面取自视频同目录的 jpg/webp 封面或生成的 <番号>.png）…"))
             out_dir = os.path.join(os.getcwd(), "video_thumb_output")
             chm_path = vtl.build_chm(videos, out_dir, directory)
             self.q.put(("chm_done", chm_path))
