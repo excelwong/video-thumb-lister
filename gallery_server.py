@@ -18,10 +18,10 @@
 端点：
   /                              -> 重定向到 /<gallery_name>
   /<gallery_name>.html           -> 画廊页面（同一输出目录内可有多份画廊）
-  /thumb?path=<缩略图绝对路径>   -> 该视频的封面缩略图文件（jpg/webp/png，按扩展名返回正确 MIME）
+  /thumb?path=<视频绝对路径>      -> 该视频的首帧缩略图（.thumb.jpg）
   /video?path=<视频绝对路径>      -> 原视频文件（支持 Range，可在弹窗中播放/拖拽）
   /open-explorer?path=<目录绝对路径> -> 调用系统文件浏览器定位到该目录
-  /play?path=<视频绝对路径>       -> 用系统默认视频播放器（如 PotPlayer）打开并播放该视频
+  /play?path=<视频绝对路径>       -> 调起本机 PotPlayer 播放该视频
 """
 
 import os
@@ -38,13 +38,6 @@ import argparse
 # 优先级：命令行 --port > 环境变量 VTL_GALLERY_PORT > 默认 8765。
 # --------------------------------------------------------------------------
 DEFAULT_PORT = 8765
-
-# 1x1 透明 PNG（用于 /ping 健康探测：file:// 页面用 Image() 跨域探测时，
-# 只有真正的图片资源才会触发 onload，文本响应会触发 onerror 造成误报）。
-PING_PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-    "0000000a49444154789c6300000002000001e221bc330000000049454e44ae426082"
-)
 
 
 def gallery_server_port(explicit=None):
@@ -80,23 +73,46 @@ def gallery_server_base(port=None):
 
 
 # --------------------------------------------------------------------------
-# 打开视频：用操作系统【默认关联程序】播放（即「在文件浏览器中双击文件」的效果，
-# 由本机默认视频播放器——如 PotPlayer——打开并播放）。无需定位特定播放器可执行文件。
+# 本地播放器：仅 PotPlayer（点击缩略图时唤起本机 PotPlayer 播放）。
 # --------------------------------------------------------------------------
-def open_with_default(path):
-    """用系统默认程序打开文件（等价于在资源管理器双击，由默认播放器接管）。返回是否成功。"""
+_PLAYER_PORTABLE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local")),
+    "Programs", "PotPlayer")
+PLAYER_CANDIDATES = [
+    os.path.join(_PLAYER_PORTABLE_DIR, "PotPlayerMini64.exe"),
+    os.path.join(_PLAYER_PORTABLE_DIR, "PotPlayer64.exe"),
+    r"C:/Program Files/PotPlayer/PotPlayerMini64.exe",
+    r"C:/Program Files/PotPlayer/PotPlayer64.exe",
+    r"C:/Program Files/PotPlayer/PotPlayer.exe",
+    r"C:/Program Files (x86)/PotPlayer/PotPlayer.exe",
+    r"C:/PotPlayer/PotPlayer.exe",
+    "PotPlayerMini64.exe",
+    "PotPlayer64.exe",
+    "PotPlayer.exe",
+]
+
+
+def find_player():
+    """返回本机可用的 PotPlayer 可执行文件路径；找不到返回 None。"""
+    for c in PLAYER_CANDIDATES:
+        if os.path.isfile(c):
+            return c
+    for name in ("PotPlayerMini64.exe", "PotPlayer64.exe", "PotPlayer.exe"):
+        p = shutil.which(name)
+        if p:
+            return p
     try:
-        if sys.platform == "win32":
-            os.startfile(path)  # 资源管理器「打开」动词：默认视频播放器（PotPlayer 等）直接播放
-        elif sys.platform == "darwin":
-            subprocess.run(["open", path], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
-        else:
-            subprocess.run(["xdg-open", path], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
-        return True
+        import glob as _glob
+        base = os.path.dirname(_PLAYER_PORTABLE_DIR)
+        for pat in (os.path.join(base, "**", "PotPlayerMini64.exe"),
+                    os.path.join(base, "**", "PotPlayer64.exe"),
+                    os.path.join(base, "**", "PotPlayer.exe")):
+            hits = _glob.glob(pat, recursive=True)
+            if hits:
+                return hits[0]
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    return None
 
 
 def _cors(handler):
@@ -125,15 +141,6 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                 ".webm": "video/webm", ".mov": "video/quicktime",
                 ".avi": "video/x-msvideo", ".m4v": "video/x-m4v",
                 ".ts": "video/mp4", ".ogv": "video/ogg",
-            }.get(ext, "application/octet-stream")
-
-        def _ct_for_image(self, path):
-            """按扩展名返回图片 MIME（封面缩略图可能是 jpg/webp/png）。"""
-            ext = os.path.splitext(path)[1].lower()
-            return {
-                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".png": "image/png", ".webp": "image/webp",
-                ".gif": "image/gif", ".bmp": "image/bmp",
             }.get(ext, "application/octet-stream")
 
         def _serve_file(self, fpath, ctype, range_ok=True):
@@ -200,7 +207,7 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
             elif path == "/thumb":
                 p = qs.get("path", [""])[0]
                 if p:
-                    self._serve_file(p, self._ct_for_image(p), range_ok=False)
+                    self._serve_file(p + ".thumb.jpg", "image/jpeg", range_ok=False)
                 else:
                     self.send_error(400)
             elif path == "/video":
@@ -235,21 +242,37 @@ def serve_gallery(out_dir, port=0, gallery_name="gallery.html"):
                 _cors(self)
                 self.end_headers()
                 self.wfile.write(body)
-            elif path == "/ping":
-                # 健康探测：返回 1x1 PNG（供 file:// 页面用 Image() 跨域探测服务是否在线）。
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-                self.send_header("Content-Length", str(len(PING_PNG)))
-                _cors(self)
-                self.end_headers()
-                self.wfile.write(PING_PNG)
             elif path == "/play":
                 p = qs.get("path", [""])[0]
                 if not p or not os.path.isfile(p):
                     self.send_error(404)
                     return
-                # 用系统默认关联程序打开视频（默认视频播放器接管，无需定位具体 exe）。
-                ok = open_with_default(p)
+                player = find_player()
+                if not player:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", "8")
+                    _cors(self)
+                    self.end_headers()
+                    self.wfile.write(b"noplayer")
+                    return
+                try:
+                    if sys.platform == "win32":
+                        subprocess.Popen(
+                            [player, p],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    else:
+                        subprocess.Popen(
+                            [player, p],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    ok = True
+                except Exception:  # noqa: BLE001
+                    ok = False
                 self.send_response(200)
                 body = b"ok" if ok else b"err"
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
