@@ -1099,15 +1099,11 @@ ctx.addEventListener('click', function(e){
   }
 });
 
-function makeThumbUrl(thumb){ return SERVER_BASE + '/thumb?path=' + encodeURIComponent(thumb); }
 function makeVurl(p, fp){ return SERVER_BASE + '/video?path=' + encodeURIComponent(p); }
 
-// 初始化：每张卡片的缩略图走本应用本地服务 /thumb，点击走 /play 调起 PotPlayer。
-// 画廊服务（gallery_server.py）是【独立常驻进程】——只要本机曾运行过本应用，
-// 即使直接双击 .html（file://）打开，服务通常仍在运行，缩略图与 PotPlayer 都正常。
-// 因此这里【始终经由服务】，只有当服务确实不可达时才用 file:// 本地文件兜底：
-//   - 缩略图：onerror 退回同目录本地图片（仍可显示）；
-//   - 视频：openPlayer 的 fetch 失败会打开【所在文件夹】（交由用户用 PotPlayer 双击）。
+// 缩略图：【直接以「文件浏览器地址 file://」嵌入】，双击 html 即可显示封面，
+// 不依赖本地服务运行（避免服务未启动/端口变化导致图片加载失败）。
+// 点击：仍经本应用本地服务 /play 调起本机 PotPlayer（任意格式直接播放）。
 // 切勿把点击 href 直接写成 file:// 视频：浏览器会把 mp4/avi 当成下载或内联播放，
 // 无法唤起 PotPlayer；必须由服务 /play 端点在本机 spawn PotPlayer 进程。
 document.addEventListener('DOMContentLoaded', function(){
@@ -1119,9 +1115,9 @@ document.addEventListener('DOMContentLoaded', function(){
     if (img) {
       var thumb = card.dataset.thumb || '';
       if (thumb) {
-        // 先挂兜底，再设 src：服务不可达时退回同目录本地封面，保证仍能看到图。
-        img.onerror = function(){ this.onerror = null; this.src = fileUrl(thumb); };
-        img.src = makeThumbUrl(thumb);
+        // 缩略图直接以文件浏览器地址（file://）嵌入；加载失败则隐藏图片。
+        img.src = fileUrl(thumb);
+        img.onerror = function(){ this.style.display = 'none'; };
       } else {
         img.style.display = 'none';
       }
@@ -1199,15 +1195,14 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
 
     缩略图由 thumb_map 给出（见 resolve_thumbnail）：优先视频同目录的 jpg/webp 封面，
 
-    关键：画廊本身【不再区分 serve / file:// 两种生成方式】。
-    卡片只写入视频的绝对路径（data-path / data-fpath），URL 在浏览器端
-    按打开方式自动决定：
-      - 经本应用本地服务打开（http://）→ 走 /thumb、/video、/open-explorer；
-      - 直接双击打开（file://）→ 走本地 file:// 绝对路径。
-    因此同一份 HTML 既能由本应用服务访问，也能单独双击打开，
-    缩略图与单击播放在两种场景下都正常。
+    缩略图由 thumb_map 给出（见 resolve_thumbnail）：优先视频同目录的 jpg/webp 封面，
+    无封面则用 ffmpeg 截第 10 秒生成 <核心番号>.png。
+
+    关键：缩略图【始终以「文件浏览器地址 file://」直接写入 <img src>】，
+    双击 html 即可看到封面，不依赖 gallery_server 运行。
+    点击缩略图仍经本应用本地服务 /play 端点调起本机 PotPlayer（任意格式直接播放）。
     serve 参数仅保留用于向后兼容（GUI 仍据此决定是否启动本地服务），
-    不再影响写入的 URL 形式。
+    不再影响写入的缩略图 URL 形式（缩略图恒为 file://）。
     """
     root_abs = os.path.abspath(root)
 
@@ -1221,15 +1216,14 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
     for v in videos:
         name = os.path.basename(v)
         thumb = thumb_map.get(v) if thumb_map else None
+        # 缩略图：【始终以「文件浏览器地址 file://」直接写入 <img src>】——双击 html
+        # 即可看到封面，不依赖 gallery_server 运行（避免服务未启动/端口变化导致加载失败）。
+        thumb_url = file_url(thumb) if thumb else ""
         if serve:
-            # 缩略图走独立 gallery_server.py 的 /thumb 端点（传入【缩略图绝对路径】，
-            # 由服务端按扩展名返回正确 MIME）；视频走 /video。
+            # 点击经本应用本地服务 /play 调起本机 PotPlayer（任意格式直接播放）。
             base = gallery_server_base()
-            thumb_url = (base + "/thumb?path=" + urllib.parse.quote(thumb)
-                         if thumb else "")
             vurl = base + "/video?path=" + urllib.parse.quote(v)
         else:
-            thumb_url = file_url(thumb) if thumb else ""
             vurl = file_url(v)
         try:
             size = human_size(os.path.getsize(v))
