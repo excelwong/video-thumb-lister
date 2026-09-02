@@ -299,10 +299,10 @@ class ThumbListerApp(tk.Tk):
     def _start_server_and_open(self, out_html):
         gdir = os.path.dirname(out_html)
         gname = os.path.basename(out_html)
-        # 确保【独立后台服务】(gallery_server.py) 在运行：画廊里的缩略图、PotPlayer
-        # 播放、『打开文件浏览器』都依赖它。服务用固定端口（默认 8765），若已在线
-        # 则直接复用（可能是上次关闭 GUI 后残留的，或用户手动启动的独立进程）。
-        # 这样即使关闭 GUI 窗口、主进程退出，画廊仍可正常工作。
+        # 画廊现已全部使用 file:// 链接（缩略图 + 视频），不依赖后台服务即可播放。
+        # 此处仍会启动独立的 gallery_server.py 后台进程（无害保留，便于兼容与排错），
+        # 但实际播放/显示已不再需要它。最后用『文件资源管理器』定位并选中该画廊文件，
+        # 由用户双击以 file:// 方式打开。
         same_dir = bool(self.serve_out_dir and self.serve_out_dir == gdir)
         proc_running = (self.serve_proc is not None and self.serve_proc.poll() is None)
         if not (proc_running and same_dir):
@@ -345,8 +345,9 @@ class ThumbListerApp(tk.Tk):
         - 传入 target_html 则用它；否则优先用本次会话扫描得到的 self.out_html；
         - 若两者都没有（例如刚重开应用、还没扫描），则弹出文件选择框，
           让用户挑选一个【已生成】的画廊 HTML 文件；
-        - 打开前会确保『本地播放服务』已启动，从而左键点击 rmvb 等格式
-          仍能经由 /play 端点调起本机 PotPlayer 播放。
+        - 画廊缩略图与视频链接均为 file:// 文件浏览器地址，左键点击即相当于在
+          资源管理器双击视频文件、由系统默认播放器（PotPlayer 等）播放，无需本地服务。
+          此处仍会启动后台服务（无害），但播放已不依赖它。
         """
         target = target_html or self.out_html
         # 清理掉不存在的路径

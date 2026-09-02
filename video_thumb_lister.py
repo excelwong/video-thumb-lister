@@ -58,7 +58,6 @@ import webbrowser
 # 再维护一份重复的 HTTP 服务实现。
 from gallery_server import (  # noqa: E402
     gallery_server_port,
-    gallery_server_base,
     is_server_up,
     run_server,
 )
@@ -967,37 +966,10 @@ document.getElementById('q').addEventListener('input', function(){
 });
 </script>
 <script>
-function openFallback(url){
-  // 无法经画廊服务唤起本机默认播放器时的兜底：提示用户（不再在浏览器内联播放）。
-  alert('无法打开视频播放：请确认画廊服务（gallery_server.py）正在运行，且本机已设置默认视频播放器。');
-}
-function openPlayer(url){
-  // 始终通过独立的 gallery_server.py（SERVER_BASE）调起本机【默认视频播放器】
-  // （如 PotPlayer，由系统文件关联决定），支持【所有格式】，
-  // 因此任何后缀都直接交给本机播放器、不会在浏览器内播放或变成下载。
-  // url 形如 SERVER_BASE + '/video?path=<encoded 绝对路径>'
-  var abs = '';
-  try {
-    var u = new URL(url, location.href);
-    abs = decodeURIComponent(u.searchParams.get('path') || '');
-  } catch (e) { abs = ''; }
-  if (!abs) { openFallback(url); return; }
-  fetch(SERVER_BASE + '/play?path=' + encodeURIComponent(abs))
-    .then(function(r){ return r.text(); })
-    .then(function(t){
-      if (t === 'err') { alert('调用播放器失败，请确认本机已设置默认视频播放器。'); }
-      // 'ok' 表示已交由本机默认播放器（如 PotPlayer）打开并播放
-    })
-    .catch(function(){
-      var last = Math.max(abs.lastIndexOf('/'), abs.lastIndexOf(String.fromCharCode(92)));
-      var dir = last > 0 ? abs.slice(0, last) : abs;
-      window.open('file:///' + dir);
-      alert('未能连接画廊服务（gallery_server.py）。已为你打开视频所在文件夹，请用本机默认播放器双击播放。');
-    });
-}
-</script>
-<script>
-var SERVER_BASE = '___SERVER_BASE___';
+// 画廊缩略图与播放链接【全部使用文件浏览器地址 file://】：
+//   - 缩略图直接以 file:// 嵌入，双击 html 即可看到封面，不依赖任何本地服务。
+//   - 点击缩略图 = 在资源管理器双击视频文件，由【系统默认视频播放器】（PotPlayer 等）
+//     接管播放；不再经过本应用本地服务 / 网络 URL。
 var ctx = document.getElementById('ctx');
 var ctxPath = '', ctxFp = '';
 function showCtx(e, path, fpath){
@@ -1013,41 +985,23 @@ document.getElementById('grid').addEventListener('contextmenu', function(e){
   if (!card) return;
   showCtx(e, card.dataset.path, card.dataset.fpath);
 });
-// 普通左键单击缩略图：拦截默认跳转（直接访问 /video 会让浏览器把
-// avi/rmvb 等放不了的格式当成下载），改为走 openPlayer →
-// http 模式下调 /play 唤起本机 PotPlayer（任意格式都直接播放）。
-document.getElementById('grid').addEventListener('click', function(e){
-  var link = e.target.closest('a.thumb-link');
-  if (!link) return;
-  e.preventDefault();
-  openPlayer(link.getAttribute('href'));
-});
+// 右键菜单：
+//   - 播放：用 file:// 直接打开视频文件，交由系统默认播放器播放；
+//   - 打开文件夹：用 file:// 打开视频所在目录。
+// 两者都不走本地服务（纯文件浏览器地址）。
 ctx.addEventListener('click', function(e){
   var it = e.target.closest('.ctx-item'); if (!it) return;
   var act = it.dataset.act;
   ctx.style.display = 'none';
   if (act === 'play') {
-    openPlayer(makeVurl(ctxPath, ctxFp));
+    window.open('file:///' + ctxPath.replace(/\\/g, '/'));
   } else if (act === 'explore') {
     var last = Math.max(ctxPath.lastIndexOf('/'), ctxPath.lastIndexOf(String.fromCharCode(92)));
     var dir = last > 0 ? ctxPath.slice(0, last) : ctxPath;
-    fetch(SERVER_BASE + '/open-explorer?path=' + encodeURIComponent(dir))
-      .then(function(r){ if (!r.ok) alert('打开文件浏览器失败：服务返回 ' + r.status); })
-      .catch(function(){
-        window.open('file:///' + ctxFp.substring(0, ctxFp.lastIndexOf('/')));
-        alert('未能连接画廊服务（gallery_server.py），已改为直接打开所在文件夹。');
-      });
-
+    window.open('file:///' + dir.replace(/\\/g, '/'));
   }
 });
 
-function makeVurl(p, fp){ return SERVER_BASE + '/video?path=' + encodeURIComponent(p); }
-
-// 缩略图：【直接以「文件浏览器地址 file://」嵌入】，双击 html 即可显示封面，
-// 不依赖本地服务运行（避免服务未启动/端口变化导致图片加载失败）。
-// 点击：仍经本应用本地服务 /play 调起本机 PotPlayer（任意格式直接播放）。
-// 切勿把点击 href 直接写成 file:// 视频：浏览器会把 mp4/avi 当成下载或内联播放，
-// 无法唤起 PotPlayer；必须由服务 /play 端点在本机 spawn PotPlayer 进程。
 document.addEventListener('DOMContentLoaded', function(){
   function fileUrl(abs){ return 'file:///' + encodeURI((abs || '').replace(/\\/g, '/')); }
   document.querySelectorAll('.card').forEach(function(card){
@@ -1065,8 +1019,9 @@ document.addEventListener('DOMContentLoaded', function(){
       }
     }
     if (a) {
-      // 点击经由 openPlayer -> 服务 /play 调起本机 PotPlayer（任意格式均直接播放）。
-      a.href = makeVurl(p, fp);
+      // 播放链接直接写成视频的 file:// 路径：点击即相当于在资源管理器双击文件，
+      // 由系统默认视频播放器（PotPlayer 等）接管播放。
+      a.href = fileUrl(p);
     }
   });
 });
@@ -1140,11 +1095,12 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
     缩略图由 thumb_map 给出（见 resolve_thumbnail）：优先视频同目录的 jpg/webp 封面，
     无封面则用 ffmpeg 截第 10 秒生成 <核心番号>.png。
 
-    关键：缩略图【始终以「文件浏览器地址 file://」直接写入 <img src>】，
-    双击 html 即可看到封面，不依赖 gallery_server 运行。
-    点击缩略图仍经本应用本地服务 /play 端点调起本机 PotPlayer（任意格式直接播放）。
+    关键：缩略图与播放链接【均以「文件浏览器地址 file://」直接写入】
+    （<img src> 为封面 file://、<a href> 为视频 file://），
+    双击 html 即可看到封面；点击缩略图即相当于在资源管理器双击视频文件，
+    由系统默认视频播放器（PotPlayer 等）接管播放，不依赖本应用本地服务 / 网络 URL。
     serve 参数仅保留用于向后兼容（GUI 仍据此决定是否启动本地服务），
-    不再影响写入的缩略图 URL 形式（缩略图恒为 file://）。
+    不再影响写入的 URL 形式（缩略图、视频链接恒为 file://）。
     """
     root_abs = os.path.abspath(root)
 
@@ -1161,12 +1117,10 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
         # 缩略图：【始终以「文件浏览器地址 file://」直接写入 <img src>】——双击 html
         # 即可看到封面，不依赖 gallery_server 运行（避免服务未启动/端口变化导致加载失败）。
         thumb_url = file_url(thumb) if thumb else ""
-        if serve:
-            # 点击经本应用本地服务 /play 调起本机 PotPlayer（任意格式直接播放）。
-            base = gallery_server_base()
-            vurl = base + "/video?path=" + urllib.parse.quote(v)
-        else:
-            vurl = file_url(v)
+        # 点击播放链接【始终以「文件浏览器地址 file://」写入 <a href>】：
+        # 点击即相当于在资源管理器双击视频文件，由系统默认视频播放器（PotPlayer 等）接管播放，
+        # 不依赖本应用本地服务 / 网络 URL。
+        vurl = file_url(v)
         try:
             size = human_size(os.path.getsize(v))
         except OSError:
@@ -1198,7 +1152,6 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
         .replace("___COUNT___", str(len(videos)))
         .replace("___ROOT___", html.escape(root_abs, quote=True))
         .replace("___GEN___", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        .replace("___SERVER_BASE___", gallery_server_base())
     )
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)
