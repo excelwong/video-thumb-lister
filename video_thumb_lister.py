@@ -58,6 +58,7 @@ import webbrowser
 # 再维护一份重复的 HTTP 服务实现。
 from gallery_server import (  # noqa: E402
     gallery_server_port,
+    gallery_server_base,
     is_server_up,
     run_server,
 )
@@ -966,10 +967,12 @@ document.getElementById('q').addEventListener('input', function(){
 });
 </script>
 <script>
-// 画廊缩略图与播放链接【全部使用文件浏览器地址 file://】：
-//   - 缩略图直接以 file:// 嵌入，双击 html 即可看到封面，不依赖任何本地服务。
-//   - 点击缩略图 = 在资源管理器双击视频文件，由【系统默认视频播放器】（PotPlayer 等）
-//     接管播放；不再经过本应用本地服务 / 网络 URL。
+// 画廊缩略图用「文件浏览器地址 file://」直接嵌入（双击 html 即可见封面，不依赖服务）。
+// 视频链接 <a href> 也写成 file://（用户可见、可复制），但【左键点击会被 JS 拦截】，
+// 转经本应用本地服务的 /play 端点调起【系统默认视频播放器】（如 PotPlayer）播放——
+// 这正是「昨天」稳稳弹出本机播放器的机制：gallery_server.py 用 os.startfile(视频)，
+// 等价于在资源管理器双击文件，任何格式、任何安装位置都能直接播。服务不可用时退回 file://。
+var SERVER_BASE = '___SERVER_BASE___';
 var ctx = document.getElementById('ctx');
 var ctxPath = '', ctxFp = '';
 function showCtx(e, path, fpath){
@@ -985,27 +988,51 @@ document.getElementById('grid').addEventListener('contextmenu', function(e){
   if (!card) return;
   showCtx(e, card.dataset.path, card.dataset.fpath);
 });
-// 右键菜单：
-//   - 播放：用 file:// 直接打开视频文件，交由系统默认播放器播放；
-//   - 打开文件夹：用 file:// 打开视频所在目录。
-// 两者都不走本地服务（纯文件浏览器地址）。
+
+// 经本地服务 /play 调起本机默认播放器（PotPlayer 等）；服务不可用时退回 file:// 链接。
+function playVideo(abs){
+  if (!abs) return;
+  fetch(SERVER_BASE + '/play?path=' + encodeURIComponent(abs))
+    .then(function(r){ if (!r.ok) throw new Error('bad'); })
+    .catch(function(){
+      // 服务未运行（如关闭 app 后直接双击 html）：退回 file://，由系统默认关联处理。
+      window.open('file:///' + abs.replace(/\\/g, '/'));
+    });
+}
+// 经本地服务 /open-explorer 打开文件浏览器定位目录；失败退回 file://。
+function openExplorer(abs){
+  if (!abs) return;
+  fetch(SERVER_BASE + '/open-explorer?path=' + encodeURIComponent(abs))
+    .then(function(r){ if (!r.ok) throw new Error('bad'); })
+    .catch(function(){ window.open('file:///' + abs.replace(/\\/g, '/')); });
+}
+
+// 左键单击缩略图：拦截默认跳转，改走服务 /play 调起默认播放器（稳，任何格式均可）。
+document.getElementById('grid').addEventListener('click', function(e){
+  var link = e.target.closest('a.thumb-link');
+  if (!link) return;
+  e.preventDefault();
+  var card = link.closest('.card');
+  playVideo(card.dataset.path);
+});
+// 右键菜单：播放 / 打开文件夹，均优先走服务，失败退回 file://。
 ctx.addEventListener('click', function(e){
   var it = e.target.closest('.ctx-item'); if (!it) return;
   var act = it.dataset.act;
   ctx.style.display = 'none';
   if (act === 'play') {
-    window.open('file:///' + ctxPath.replace(/\\/g, '/'));
+    playVideo(ctxPath);
   } else if (act === 'explore') {
     var last = Math.max(ctxPath.lastIndexOf('/'), ctxPath.lastIndexOf(String.fromCharCode(92)));
     var dir = last > 0 ? ctxPath.slice(0, last) : ctxPath;
-    window.open('file:///' + dir.replace(/\\/g, '/'));
+    openExplorer(dir);
   }
 });
 
 document.addEventListener('DOMContentLoaded', function(){
   function fileUrl(abs){ return 'file:///' + encodeURI((abs || '').replace(/\\/g, '/')); }
   document.querySelectorAll('.card').forEach(function(card){
-    var p = card.dataset.path, fp = card.dataset.fpath;
+    var p = card.dataset.path;
     var img = card.querySelector('img');
     var a = card.querySelector('a.thumb-link');
     if (img) {
@@ -1019,8 +1046,7 @@ document.addEventListener('DOMContentLoaded', function(){
       }
     }
     if (a) {
-      // 播放链接直接写成视频的 file:// 路径：点击即相当于在资源管理器双击文件，
-      // 由系统默认视频播放器（PotPlayer 等）接管播放。
+      // 视频链接写成 file://（文件浏览器地址，可见/可复制）；点击由 playVideo 拦截走 /play。
       a.href = fileUrl(p);
     }
   });
@@ -1095,12 +1121,17 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
     缩略图由 thumb_map 给出（见 resolve_thumbnail）：优先视频同目录的 jpg/webp 封面，
     无封面则用 ffmpeg 截第 10 秒生成 <核心番号>.png。
 
-    关键：缩略图与播放链接【均以「文件浏览器地址 file://」直接写入】
-    （<img src> 为封面 file://、<a href> 为视频 file://），
-    双击 html 即可看到封面；点击缩略图即相当于在资源管理器双击视频文件，
-    由系统默认视频播放器（PotPlayer 等）接管播放，不依赖本应用本地服务 / 网络 URL。
+    关键：
+    - 缩略图【始终以「文件浏览器地址 file://」直接写入 <img src>】，双击 html
+      即可看到封面，不依赖本应用本地服务（避免服务未启动/端口变化导致图片加载失败）。
+    - 视频链接 <a href> 同样写成「文件浏览器地址 file://」（用户可见、可右键复制），
+      但左键点击时由 JS 拦截、转经本应用本地服务的 /play 端点
+      （gallery_server.py）调起【系统默认视频播放器】（如 PotPlayer）播放——
+      这正是「昨天」稳稳弹出本机播放器的机制：服务用 os.startfile(视频) 等价于在
+      资源管理器双击文件，任何格式、任何安装位置都能直接播。服务不可用时退回 file://
+      链接交由浏览器/系统默认关联处理（兜底）。
     serve 参数仅保留用于向后兼容（GUI 仍据此决定是否启动本地服务），
-    不再影响写入的 URL 形式（缩略图、视频链接恒为 file://）。
+    不影响写入的缩略图 URL 形式（缩略图恒为 file://）。
     """
     root_abs = os.path.abspath(root)
 
@@ -1152,6 +1183,7 @@ def build_gallery(videos, out_html, root, serve=False, thumb_map=None):
         .replace("___COUNT___", str(len(videos)))
         .replace("___ROOT___", html.escape(root_abs, quote=True))
         .replace("___GEN___", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        .replace("___SERVER_BASE___", gallery_server_base())
     )
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)

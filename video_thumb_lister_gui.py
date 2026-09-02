@@ -299,10 +299,10 @@ class ThumbListerApp(tk.Tk):
     def _start_server_and_open(self, out_html):
         gdir = os.path.dirname(out_html)
         gname = os.path.basename(out_html)
-        # 画廊现已全部使用 file:// 链接（缩略图 + 视频），不依赖后台服务即可播放。
-        # 此处仍会启动独立的 gallery_server.py 后台进程（无害保留，便于兼容与排错），
-        # 但实际播放/显示已不再需要它。最后用『文件资源管理器』定位并选中该画廊文件，
-        # 由用户双击以 file:// 方式打开。
+        # 画廊缩略图用 file:// 直嵌（不依赖服务即可看图）；但点击播放经由本后台服务的
+        # /play 端点 = 用 os.startfile(视频) 调起系统默认播放器（如 PotPlayer），这正是
+        # 「稳稳弹出本机播放器」的机制。故点击播放依赖此服务在运行——这里启动/复用它。
+        # 最后用『文件资源管理器』定位并选中该画廊文件，由用户双击以 file:// 方式打开。
         same_dir = bool(self.serve_out_dir and self.serve_out_dir == gdir)
         proc_running = (self.serve_proc is not None and self.serve_proc.poll() is None)
         if not (proc_running and same_dir):
@@ -345,8 +345,8 @@ class ThumbListerApp(tk.Tk):
         - 传入 target_html 则用它；否则优先用本次会话扫描得到的 self.out_html；
         - 若两者都没有（例如刚重开应用、还没扫描），则弹出文件选择框，
           让用户挑选一个【已生成】的画廊 HTML 文件；
-        - 画廊缩略图与视频链接均为 file:// 文件浏览器地址，左键点击即相当于在
-          资源管理器双击视频文件、由系统默认播放器（PotPlayer 等）播放，无需本地服务。
+        - 画廊缩略图为 file:// 文件浏览器地址（不依赖服务即可看图）；左键点击缩略图经
+          本应用本地服务 /play 调起系统默认播放器（PotPlayer 等）播放，无需定位播放器 exe。
           此处仍会启动后台服务（无害），但播放已不依赖它。
         """
         target = target_html or self.out_html
