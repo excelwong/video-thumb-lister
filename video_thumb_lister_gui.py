@@ -352,7 +352,7 @@ class ThumbListerApp(tk.Tk):
             self.serve_port = port
             self.serve_out_dir = gdir
             self.stop_btn.configure(state="normal")
-            self._log(f"后台服务已就绪（独立进程 gallery_server.py，关闭窗口也会继续）："
+            self._log(f"后台服务已就绪（独立进程 gallery_server，关闭窗口也会继续）："
                        f"http://127.0.0.1:{port}/{gname}")
             # 起好后做一次版本自检：万一端口仍被杀不掉的旧服务占着，明确告知用户
             if not vtl.server_version_matches(port):

@@ -1663,11 +1663,14 @@ def build_chm(videos, out_dir, root, thumb_map=None):
 
 
 def launch_server_subprocess(out_dir, gallery_name, port_file):
-    """启动【脱离父进程】的后台画廊服务（独立的 gallery_server.py），返回 (proc, port)。
+    """启动【脱离父进程】的后台画廊服务（gallery_server），返回 (proc, port)。
+
+    服务程序优先用同目录下打包好的 gallery_server.exe（无需本机安装 Python）；
+    exe 不存在时自动回退到 gallery_server.py + sys.executable。
 
     返回值为元组：
       - proc：新启动的子进程 Popen；若同名端口已有服务在跑（上一次脱离父进程
-              残留的、或用户手动启动的独立 gallery_server.py），则为 None（复用）。
+              残留的、或用户手动启动的独立 gallery_server），则为 None（复用）。
       - port：服务实际绑定的端口（固定默认 8765，或环境变量 VTL_GALLERY_PORT）。
 
     仅在 Windows 上追加 DETACHED_PROCESS | CREATE_NO_WINDOW，使其彻底独立于
@@ -1683,10 +1686,19 @@ def launch_server_subprocess(out_dir, gallery_name, port_file):
             pass
         return (None, port)
 
-    server_script = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "gallery_server.py")
-    cmd = [sys.executable, server_script, "--dir", out_dir,
-           "--name", gallery_name, "--port", str(port), "--port-file", port_file]
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    server_exe = os.path.join(app_dir, "gallery_server.exe")
+    server_script = os.path.join(app_dir, "gallery_server.py")
+    if os.path.isfile(server_exe):
+        # 优先用打包好的 exe（目标机无需装 Python）；exe 缺失则回退到 .py。
+        # 必须带 --foreground：exe 默认是守护模式（拉起后台进程后自己就退出了），
+        # 那样 GUI 拿到的进程句柄会立刻失效，也就没法再用它停止服务。
+        cmd = [server_exe, "--foreground", "--dir", out_dir, "--name", gallery_name,
+               "--port", str(port), "--port-file", port_file]
+    else:
+        # 源码版 gallery_server.py 本身就是前台阻塞的，且不认 --foreground
+        cmd = [sys.executable, server_script, "--dir", out_dir,
+               "--name", gallery_name, "--port", str(port), "--port-file", port_file]
     flags = 0
     if sys.platform == "win32":
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
@@ -1720,9 +1732,11 @@ def server_version_matches(port=None):
 def stop_stale_server(port=None):
     """结束占用端口的【本应用】画廊服务进程（用于旧版本残留服务的自动重启）。
 
-    安全识别方式：通过进程命令行确认是 gallery_server.py 才结束——
-    新旧版本的服务进程命令行相同（都含 gallery_server.py），因此旧版本
+    安全识别方式：通过进程命令行确认是 gallery_server 才结束——
+    新旧版本的服务进程命令行相同（都含 gallery_server），因此旧版本
     （没有 /ping 端点）也能被正确识别并结束；其他程序绝不触碰。
+    注意：服务可能是 gallery_server.py（源码方式）或 gallery_server.exe
+    （打包方式），两种都要认，否则 exe 版服务永远杀不掉、端口一直被占。
     返回是否成功结束了进程。
     """
     port = gallery_server_port(port)
@@ -1753,8 +1767,11 @@ def stop_stale_server(port=None):
                 pass
     killed = False
     for pid in pids:
-        # 2) 确认该进程命令行确实是本应用的 gallery_server.py（防误杀）
-        if "gallery_server.py" not in _pid_commandline(pid).lower():
+        # 2) 确认该进程命令行确实是本应用的 gallery_server（防误杀）
+        #    PyInstaller onefile 会派生子进程，真正监听端口的是子进程，
+        #    其命令行同样含 exe 路径，故按 "gallery_server" 整体匹配最稳妥。
+        cmdline = _pid_commandline(pid).lower()
+        if "gallery_server.py" not in cmdline and "gallery_server.exe" not in cmdline:
             continue
         try:
             r = subprocess.run(
